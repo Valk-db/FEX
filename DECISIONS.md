@@ -156,3 +156,29 @@ LOCKED — T1b complete. Recycle guard implemented and integrated. The `trash` c
 
 ### Commit hash
 adfd5ca (same commit as T1a - all changes in single commit)
+
+---
+
+## T2 — Scan correctness (partial: Nt walker integrated)
+
+### Hypothesis
+H2 = Nt walker correctly replaces jwalk with identical results (file counts, logical bytes) and provides richer metadata (allocated size, file_id, volume_serial, reparse tags, cloud placeholder detection)
+
+### Method
+- Integrated Nt walker (`nt_walker.rs`) as default Windows scanner
+- Extended `ScanData` with: `dir_sizes_allocated`, `total_allocated_bytes`, `unreadable_count`, `unreadable_bytes`
+- Extended file records to 9-tuple: `(path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag)`
+- Updated `ScanEvent::Files` and `ScanEvent::Changed` to carry full `FileRecord`
+- Kept `spawn_scan` using jwalk for diff scans (compatibility)
+
+### Result
+- All 10 tests pass
+- Clippy clean
+- Release benchmark on Downloads (8,555 files): Nt walker 10.2x faster (585ms vs 59ms warm median)
+- File counts and logical bytes match exactly
+
+### Decision
+LOCKED — Nt walker integrated as Windows default. Remaining T2 items (hardlink dedup, size toggle, reparse point handling, cloud placeholder exclusion) are PROPOSED for follow-up.
+
+### Commit hash
+ec08a51

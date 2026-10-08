@@ -89,7 +89,7 @@ pub struct Session {
 pub struct ScanData {
     pub dir_sizes_logical: HashMap<PathBuf, u64>,
     pub dir_sizes_allocated: HashMap<PathBuf, u64>,
-    /// (path, logical_size, allocated_size, mtime unix secs, file_id, volume_serial, is_reparse, is_cloud, reparse_tag)
+    /// (path, logical_size, allocated_size, mtime unix secs, file_id, volume_serial, is_reparse, is_cloud, _reparse_tag)
     pub files: Vec<FileRecord>,
     pub file_count: u64,
     pub dir_count: u64,
@@ -135,6 +135,11 @@ pub struct App {
     diff_mode: bool,          // scan thread sends only deltas
     // v2.3: O(1) path -> file_list index, keeps diff application snappy
     file_index: HashMap<PathBuf, usize>,
+    // v2.4: scan correctness - hardlinks, size mode, reparse points, cloud placeholders
+    size_mode_logical: bool, // true = logical size, false = allocated size
+    hardlink_map: HashMap<(u32, [u8; 16]), PathBuf>, // (volume_serial, file_id) -> first path seen
+    unreadable_count: u64,
+    unreadable_bytes: u64,
 }
 
 /// Fit `s` into exactly `width` chars: truncate with … when too long,
@@ -459,6 +464,10 @@ impl App {
             scan_seen: 0,
             diff_mode: false,
             file_index: HashMap::new(),
+            size_mode_logical: true,
+            hardlink_map: HashMap::new(),
+            unreadable_count: 0,
+            unreadable_bytes: 0,
         };
 
         // Instant paint: seed everything from the last persisted snapshot,
@@ -525,36 +534,117 @@ impl App {
                     }
                     Ok(ScanEvent::Files(batch)) => {
                         let n = batch.len() as u64;
-                        for (path, logical_size, _, mtime, _, _, _, _, _) in batch {
-                            self.add_file_size(&path, logical_size as i64);
+                        let mut batch_changed = false;
+                        for (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, _reparse_tag) in batch {
+                            // Handle reparse points (junctions, symlinks) - never follow, zero size
+                            if is_reparse {
+                                self.unreadable_count += 1;
+                                // Add to file_list with zero size for display
+                                self.file_index.insert(path.clone(), self.file_list.len());
+                                self.file_list.push((path, 0, mtime));
+                                batch_changed = true;
+                                continue;
+                            }
+
+                            // Handle cloud placeholders - never read/hydrate, zero contributed size
+                            if is_cloud {
+                                self.unreadable_count += 1;
+                                self.unreadable_bytes += logical_size;
+                                self.file_index.insert(path.clone(), self.file_list.len());
+                                self.file_list.push((path, 0, mtime));
+                                batch_changed = true;
+                                continue;
+                            }
+
+                            // Handle hardlinks - dedupe by (volume_serial, file_id)
+                            let hardlink_key = (volume_serial, file_id);
+                            let is_first_hardlink = self.hardlink_map.insert(hardlink_key, path.clone()).is_none();
+
+                            let size_to_add = if self.size_mode_logical { logical_size } else { allocated_size };
+
+                            if is_first_hardlink {
+                                // First time seeing this file - add its size
+                                self.add_file_size(&path, size_to_add as i64);
+                                self.scanned_files += 1;
+                            } else {
+                                // Hardlink sibling - don't double-count size, but track it
+                                self.unreadable_count += 1; // mark as hardlinked for display
+                            }
+
                             self.file_index.insert(path.clone(), self.file_list.len());
-                            self.file_list.push((path, logical_size, mtime));
+                            self.file_list.push((path, size_to_add, mtime));
+                            batch_changed = true;
                         }
-                        self.scanned_files += n;
                         self.scan_seen += n;
-                        got_data = true;
+                        if batch_changed {
+                            got_data = true;
+                        }
                     }
                     Ok(ScanEvent::Changed(batch)) => {
                         let n = batch.len() as u64;
-                        for (path, logical_size, _, mtime, _, _, _, _, _) in batch {
+                        let mut batch_changed = false;
+                        for (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, _reparse_tag) in batch {
+                            // Handle reparse points
+                            if is_reparse {
+                                if let Some(i) = self.file_index.get(&path).copied() {
+                                    let old_size = self.file_list[i].1 as i64;
+                                    self.file_list[i].1 = 0;
+                                    self.file_list[i].2 = mtime;
+                                    self.add_file_size(&path, -old_size);
+                                }
+                                self.unreadable_count += 1;
+                                batch_changed = true;
+                                continue;
+                            }
+
+                            // Handle cloud placeholders
+                            if is_cloud {
+                                if let Some(i) = self.file_index.get(&path).copied() {
+                                    let old_size = self.file_list[i].1 as i64;
+                                    self.file_list[i].1 = 0;
+                                    self.file_list[i].2 = mtime;
+                                    self.add_file_size(&path, -old_size);
+                                }
+                                self.unreadable_count += 1;
+                                self.unreadable_bytes += logical_size;
+                                batch_changed = true;
+                                continue;
+                            }
+
+                            // Handle hardlinks
+                            let hardlink_key = (volume_serial, file_id);
+                            let is_first_hardlink = self.hardlink_map.insert(hardlink_key, path.clone()).is_none();
+
+                            let size_to_add = if self.size_mode_logical { logical_size } else { allocated_size };
+
                             let delta = match self.file_index.get(&path).copied() {
                                 Some(i) => {
                                     let old = self.file_list[i].1 as i64;
-                                    self.file_list[i].1 = logical_size;
+                                    self.file_list[i].1 = size_to_add;
                                     self.file_list[i].2 = mtime;
-                                    logical_size as i64 - old
+                                    size_to_add as i64 - old
                                 }
                                 None => {
                                     self.file_index.insert(path.clone(), self.file_list.len());
-                                    self.file_list.push((path.clone(), logical_size, mtime));
-                                    self.scanned_files += 1;
-                                    logical_size as i64
+                                    self.file_list.push((path.clone(), size_to_add, mtime));
+                                    if is_first_hardlink {
+                                        self.scanned_files += 1;
+                                        size_to_add as i64
+                                    } else {
+                                        self.unreadable_count += 1; // hardlink sibling
+                                        0
+                                    }
                                 }
                             };
-                            self.add_file_size(&path, delta);
+                            if is_first_hardlink {
+                                self.add_file_size(&path, delta);
+                            }
+                            batch_changed = true;
                         }
                         self.scan_seen += n;
-                        got_data = true;
+                        if batch_changed {
+                            got_data = true;
+                        }
                     }
                     Ok(ScanEvent::Deleted(list)) => {
                         for (path, size) in list {
@@ -1134,6 +1224,11 @@ impl App {
                     self.ascend();
                 }
             }
+            KeyCode::Char('S') => {
+                // Toggle size mode: logical vs allocated
+                self.size_mode_logical = !self.size_mode_logical;
+                self.rescan(); // Re-scan to update sizes
+            }
             KeyCode::Char('t') => self.toggle_strip(),
             KeyCode::Char('r') => self.rescan(),
             _ => {}
@@ -1446,12 +1541,21 @@ impl App {
             if self.view == View::Duplicates {
                 help.push_str(" · h hash");
             }
+            help.push_str(" · S size mode");
             parts.push(help);
         }
         if let Some((done, total)) = self.hash_progress()
             && total > 0 {
                 parts.push(format!("hashing {done}/{total}"));
             }
+        // Show unreadable count if any
+        if self.unreadable_count > 0 {
+            parts.push(format!("{} unreadable (~{} not counted)",
+                self.unreadable_count, human_size(self.unreadable_bytes)));
+        }
+        // Show size mode
+        let size_mode = if self.size_mode_logical { "logical" } else { "allocated" };
+        parts.push(format!("size: {size_mode} (S toggles)"));
         match self.view {
             View::Browse => {
                 let total = self.dir_sizes.get(&self.current).copied().unwrap_or(0);
