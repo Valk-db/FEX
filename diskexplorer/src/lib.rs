@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 /// Type aliases for complex scan data structures
-type FileRecord = (PathBuf, u64, u64, i64, [u8; 16], u32, bool, bool, u32);
+pub type FileRecord = (PathBuf, u64, u64, i64, [u8; 16], u32, bool, bool, u32);
 
 /// Baseline entry type: (logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag)
 #[derive(Debug, Clone, Copy, PartialEq)]

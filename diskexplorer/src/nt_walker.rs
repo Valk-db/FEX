@@ -52,7 +52,13 @@ pub fn simplify_path(path: &Path) -> PathBuf {
 
 /// Thread count for parallel Nt walker (logical cores)
 /// 0 = use rayon default (logical cores)
-const THREAD_COUNT: usize = 0;
+/// Can be overridden via DISKEXPLORER_NT_THREADS env var
+fn get_thread_count() -> usize {
+    std::env::var("DISKEXPLORER_NT_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Drive type constants (also used in recycle_guard.rs)
 const _DRIVE_UNKNOWN: u32 = 0;
@@ -342,9 +348,10 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     }
 
     // Now process all directories in parallel
-    let pool = if THREAD_COUNT != 0 {
+    let thread_count = get_thread_count();
+    let pool = if thread_count != 0 {
         ThreadPoolBuilder::new()
-            .num_threads(THREAD_COUNT)
+            .num_threads(thread_count)
             .build()
             .unwrap()
     } else {
@@ -589,9 +596,10 @@ pub fn spawn_scan_nt(
         }
 
         // Second pass: process all directories in parallel, sending events via channel
-        let pool = if THREAD_COUNT != 0 {
+        let thread_count = get_thread_count();
+        let pool = if thread_count != 0 {
             ThreadPoolBuilder::new()
-                .num_threads(THREAD_COUNT)
+                .num_threads(thread_count)
                 .build()
                 .unwrap()
         } else {
