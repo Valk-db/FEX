@@ -81,7 +81,7 @@ Built benchmark harness (`examples/bench_scan.rs`) using:
 LOCKED — H1 holds. Nt walker becomes the Windows default. jwalk kept as fallback behind a flag/cfg.
 
 ### Commit hash
-N/A (benchmark code only, not yet integrated into main scanner)
+adfd5ca
 
 ---
 
@@ -155,4 +155,4 @@ The `recycle_guard.rs` module is implemented with:
 LOCKED — T1b complete. Recycle guard implemented and integrated. The `trash` crate on this system permanently deletes files regardless of size; the guard prevents this by refusing when Recycle Bin configuration cannot be verified.
 
 ### Commit hash
-N/A (code changes not yet committed)
+adfd5ca (same commit as T1a - all changes in single commit)

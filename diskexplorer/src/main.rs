@@ -36,7 +36,7 @@ fn run(terminal: &mut DefaultTerminal, root: PathBuf) -> io::Result<()> {
 fn scan_only(root: &Path) -> io::Result<()> {
     let data = scan(root)?;
     let root = root.canonicalize()?;
-    let mut top: Vec<(&PathBuf, &u64)> = data.dir_sizes.iter().collect();
+    let mut top: Vec<(&PathBuf, &u64)> = data.dir_sizes_logical.iter().collect();
     top.sort_by(|a, b| b.1.cmp(a.1));
     println!(
         "scanned {} files in {} dirs under {}",
