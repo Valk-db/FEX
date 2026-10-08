@@ -29,6 +29,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 /// Type aliases for complex scan data structures
 type FileRecord = (PathBuf, u64, u64, i64, [u8; 16], u32, bool, bool, u32);
 
+/// Baseline entry type: (logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag)
+pub type BaselineEntry = (u64, u64, i64, [u8; 16], u32, bool, bool, u32);
+
 /// Files per streaming batch from the scan thread.
 const SCAN_BATCH: usize = 500;
 
@@ -203,87 +206,77 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
 /// Walk `root` in parallel and total up every directory's recursive size,
 /// while also collecting per-file (size, mtime) records for the db.
 /// On Windows, uses NtQueryDirectoryFileEx for speed and rich metadata.
-/// Falls back to jwalk on non-Windows or if Nt walker fails.
+/// Falls back to jwalk on non-Windows.
 pub fn scan(root: &Path) -> io::Result<ScanData> {
     #[cfg(windows)]
     {
-        if let Ok(result) = crate::nt_walker::scan_nt(root) {
-            // For now, return a simplified version - the full streaming scan
-            // will populate the data properly
-            return Ok(ScanData {
-                dir_sizes_logical: HashMap::new(),
-                dir_sizes_allocated: HashMap::new(),
-                files: Vec::new(),
-                file_count: result.file_count,
-                dir_count: result.dir_count,
-                total_logical_bytes: result.total_logical_bytes,
-                total_allocated_bytes: result.total_allocated_bytes,
-                unreadable_count: result.unreadable_count,
-                unreadable_bytes: result.unreadable_bytes,
-            });
-        }
+        // Use Nt walker's parallel scan directly to get full data
+        crate::nt_walker::scan_nt_full(root)
     }
 
-    // Fallback to jwalk
-    let root = root.canonicalize()?;
-    let mut dir_sizes_logical: HashMap<PathBuf, u64> = HashMap::new();
-    let mut dir_sizes_allocated: HashMap<PathBuf, u64> = HashMap::new();
-    let mut files: Vec<FileRecord> = Vec::new();
-    let mut file_count = 0u64;
-    let mut dir_count = 0u64;
+    #[cfg(not(windows))]
+    {
+        // Fallback to jwalk
+        let root = root.canonicalize()?;
+        let mut dir_sizes_logical: HashMap<PathBuf, u64> = HashMap::new();
+        let mut dir_sizes_allocated: HashMap<PathBuf, u64> = HashMap::new();
+        let mut files: Vec<FileRecord> = Vec::new();
+        let mut file_count = 0u64;
+        let mut dir_count = 0u64;
 
-    for entry in jwalk::WalkDir::new(&root).skip_hidden(false) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if entry.file_type().is_dir() {
-            dir_count += 1;
-            dir_sizes_logical.entry(path.clone()).or_insert(0);
-            dir_sizes_allocated.entry(path).or_insert(0);
-        } else if entry.file_type().is_file() {
-            file_count += 1;
-            let (size, mtime) = entry
-                .metadata()
-                .map(|m| (m.len(), mtime_of(&m)))
-                .unwrap_or((0, 0));
-            // jwalk doesn't provide file_id, volume_serial, etc.
-            files.push((
-                path.clone(),
-                size,
-                size,
-                mtime,
-                [0u8; 16],
-                0,
-                false,
-                false,
-                0,
-            ));
-            let mut ancestor = path.parent();
-            while let Some(dir) = ancestor {
-                *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) += size;
-                *dir_sizes_allocated.entry(dir.to_path_buf()).or_insert(0) += size;
-                if dir == root {
-                    break;
+        for entry in jwalk::WalkDir::new(&root).skip_hidden(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if entry.file_type().is_dir() {
+                dir_count += 1;
+                dir_sizes_logical.entry(path.clone()).or_insert(0);
+                dir_sizes_allocated.entry(path).or_insert(0);
+            } else if entry.file_type().is_file() {
+                file_count += 1;
+                let (size, mtime) = entry
+                    .metadata()
+                    .map(|m| (m.len(), mtime_of(&m)))
+                    .unwrap_or((0, 0));
+                // jwalk doesn't provide file_id, volume_serial, etc.
+                files.push((
+                    path.clone(),
+                    size,
+                    size,
+                    mtime,
+                    [0u8; 16],
+                    0,
+                    false,
+                    false,
+                    0,
+                ));
+                let mut ancestor = path.parent();
+                while let Some(dir) = ancestor {
+                    *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) += size;
+                    *dir_sizes_allocated.entry(dir.to_path_buf()).or_insert(0) += size;
+                    if dir == root {
+                        break;
+                    }
+                    ancestor = dir.parent();
                 }
-                ancestor = dir.parent();
             }
         }
+        let total_logical: u64 = files.iter().map(|(_, ls, _, _, _, _, _, _, _)| *ls).sum();
+        let total_allocated: u64 = files.iter().map(|(_, _, als, _, _, _, _, _, _)| *als).sum();
+        Ok(ScanData {
+            dir_sizes_logical,
+            dir_sizes_allocated,
+            files,
+            file_count,
+            dir_count,
+            total_logical_bytes: total_logical,
+            total_allocated_bytes: total_allocated,
+            unreadable_count: 0,
+            unreadable_bytes: 0,
+        })
     }
-    let total_logical: u64 = files.iter().map(|(_, ls, _, _, _, _, _, _, _)| *ls).sum();
-    let total_allocated: u64 = files.iter().map(|(_, _, als, _, _, _, _, _, _)| *als).sum();
-    Ok(ScanData {
-        dir_sizes_logical,
-        dir_sizes_allocated,
-        files,
-        file_count,
-        dir_count,
-        total_logical_bytes: total_logical,
-        total_allocated_bytes: total_allocated,
-        unreadable_count: 0,
-        unreadable_bytes: 0,
-    })
 }
 
 /// Streaming scan events. The walk runs on a background thread and the UI
@@ -301,6 +294,143 @@ pub enum ScanEvent {
     Dir(PathBuf),
 }
 
+#[cfg(windows)]
+pub fn spawn_scan(
+    root: PathBuf,
+    baseline: Option<HashMap<PathBuf, (u64, i64)>>,
+) -> Receiver<ScanEvent> {
+    // On Windows, use Nt walker for both full and diff scans
+    // Convert baseline from (size, mtime) to BaselineEntry (which has full metadata)
+    let nt_baseline = baseline.map(|base| {
+        base.into_iter()
+            .map(|(p, (s, m))| {
+                // For diff scans with jwalk baseline, we only have size+mtime
+                // Pad with zeros for missing fields - Nt walker will detect changes
+                (p, (s, s, m, [0u8; 16], 0u32, false, false, 0u32))
+            })
+            .collect::<HashMap<_, _>>()
+    });
+    let nt_rx = crate::nt_walker::spawn_scan_nt(root, nt_baseline);
+    // Convert NtScanEvent to ScanEvent
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for ev in nt_rx {
+            let scan_ev = match ev {
+                crate::nt_walker::NtScanEvent::Files(files) => ScanEvent::Files(files),
+                crate::nt_walker::NtScanEvent::Changed(files) => ScanEvent::Changed(files),
+                crate::nt_walker::NtScanEvent::Deleted(files) => ScanEvent::Deleted(files),
+                crate::nt_walker::NtScanEvent::Progress(n) => ScanEvent::Progress(n),
+                crate::nt_walker::NtScanEvent::Dir(path) => ScanEvent::Dir(path),
+            };
+            if tx.send(scan_ev).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[cfg(not(windows))]
+pub fn spawn_scan(
+    root: PathBuf,
+    baseline: Option<HashMap<PathBuf, (u64, i64)>>,
+) -> Receiver<ScanEvent> {
+    // Non-Windows fallback to jwalk
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut alive = true;
+        macro_rules! send_or_stop {
+            ($ev:expr) => {
+                if tx.send($ev).is_err() {
+                    alive = false;
+                }
+            };
+        }
+        let mut full_batch: Vec<FileRecord> = Vec::with_capacity(SCAN_BATCH);
+        let mut changed_batch: Vec<FileRecord> = Vec::with_capacity(SCAN_BATCH);
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut since_progress = 0u64;
+
+        for entry in jwalk::WalkDir::new(&root).skip_hidden(false) {
+            if !alive {
+                break;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if entry.file_type().is_dir() {
+                send_or_stop!(ScanEvent::Dir(path));
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let (size, mtime) = entry
+                .metadata()
+                .map(|m| (m.len(), mtime_of(&m)))
+                .unwrap_or((0, 0));
+            match &baseline {
+                None => {
+                    full_batch.push((path, size, size, mtime, [0u8; 16], 0, false, false, 0));
+                    if full_batch.len() >= SCAN_BATCH {
+                        send_or_stop!(ScanEvent::Files(std::mem::take(&mut full_batch)));
+                    }
+                }
+                Some(base) => {
+                    seen.insert(path.clone());
+                    let unchanged = base
+                        .get(&path)
+                        .map(|(s, m)| *s == size && *m == mtime)
+                        .unwrap_or(false);
+                    if !unchanged {
+                        changed_batch
+                            .push((path, size, size, mtime, [0u8; 16], 0, false, false, 0));
+                        if changed_batch.len() >= SCAN_BATCH {
+                            send_or_stop!(ScanEvent::Changed(std::mem::take(&mut changed_batch)));
+                        }
+                    }
+                    since_progress += 1;
+                    if since_progress >= 2000 {
+                        send_or_stop!(ScanEvent::Progress(since_progress));
+                        since_progress = 0;
+                    }
+                }
+            }
+        }
+        if !alive {
+            return;
+        }
+        match baseline {
+            None => {
+                if !full_batch.is_empty() {
+                    let _ = tx.send(ScanEvent::Files(full_batch));
+                }
+            }
+            Some(base) => {
+                if !changed_batch.is_empty() {
+                    let _ = tx.send(ScanEvent::Changed(changed_batch));
+                }
+                if since_progress > 0 {
+                    let _ = tx.send(ScanEvent::Progress(since_progress));
+                }
+                let deleted: Vec<(PathBuf, u64)> = base
+                    .iter()
+                    .filter(|(p, _)| !seen.contains(*p))
+                    .map(|(p, (s, _))| (p.clone(), *s))
+                    .collect();
+                if !deleted.is_empty() {
+                    let _ = tx.send(ScanEvent::Deleted(deleted));
+                }
+            }
+        }
+        // tx dropped here: receiver sees disconnect = scan complete
+    });
+    rx
+}
+
+#[cfg(not(windows))]
 pub fn spawn_scan(
     root: PathBuf,
     baseline: Option<HashMap<PathBuf, (u64, i64)>>,

@@ -251,3 +251,26 @@ LOCKED — T2 complete. All scan correctness features implemented.
 **Status:** REOPENED. Must fix per F1–F5.
 
 **Commit hash:** ec08a51, 6bbcb37, 81ef0a9 (original), see F1–F5 for fixes.
+
+---
+
+## F1 — Stop the bleeding: hardlink dedup on zero IDs
+
+### Hypothesis H6
+After the fix, scanning a fixture dir through the real `App`/`poll_scan` path yields dir totals equal to the sum of file sizes, and `hardlink_siblings` = 0. Before the fix, reproduce the bug with a failing test first.
+
+### Method
+- Added test `hardlink_dedup_zero_ids_does_not_dedup` that feeds jwalk-style records (file_id=[0;16], volume_serial=0) through `App::poll_scan` and verifies totals = sum of sizes and `unreadable_count` = 0.
+- Added test `hardlink_dedup_nonzero_ids_dedupes_correctly` that feeds two files with identical non-zero (file_id, volume_serial) and verifies dedup happens (total = single file size, unreadable_count = 1).
+- Fix: records with `file_id == [0;16]` or `volume_serial == 0` are treated as "identity unknown": never dedup, always count. Applied in both `ScanEvent::Files` (lib.rs:582) and `ScanEvent::Changed` (lib.rs:660) handlers.
+
+### Result
+- Both tests pass.
+- Before fix: `hardlink_dedup_zero_ids_does_not_dedup` failed with total = 100 (only first file counted).
+- After fix: total = 600 (all three files counted), `unreadable_count` = 0.
+
+### Decision
+LOCKED — H6 holds. Zero IDs no longer cause false hardlink dedup.
+
+### Commit hash
+9f78d06
