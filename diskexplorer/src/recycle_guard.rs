@@ -44,7 +44,9 @@ pub enum RefuseReason {
     BinDisabled,
     /// File size exceeds volume's Recycle Bin max capacity
     ExceedsCapacity { file_size: u64, max_capacity: u64 },
-    /// Could not determine Recycle Bin settings (conservative: refuse)
+    /// Path too long after simplification (>259 chars)
+    PathTooLong,
+    /// Could not determine Recycle Bin settings (missing key = default config = enabled, but we track this)
     UnknownConfiguration,
     /// Volume GUID not found for this path
     VolumeGuidNotFound,
@@ -79,11 +81,14 @@ impl std::fmt::Display for RefuseReason {
             RefuseReason::UnknownConfiguration => {
                 write!(
                     f,
-                    "Could not verify Recycle Bin configuration (conservative refusal)"
+                    "Could not verify Recycle Bin configuration (missing key = default config = enabled)"
                 )
             }
             RefuseReason::VolumeGuidNotFound => {
                 write!(f, "Could not find volume GUID for this path")
+            }
+            RefuseReason::PathTooLong => {
+                write!(f, "Path too long after simplification (>259 chars)")
             }
         }
     }
@@ -253,12 +258,63 @@ fn get_recycle_bin_config(volume_guid: &str) -> Option<(bool, u64)> {
     Some((bin_enabled, max_capacity_mb as u64 * 1024 * 1024))
 }
 
+/// Get volume total size for capacity fallback
+fn get_volume_total_size(path: &Path) -> Option<u64> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows::core::PCWSTR;
+    use std::os::windows::ffi::OsStrExt;
+
+    let simple = simplify_path(path);
+    let root = simple.components().next()?.as_os_str();
+    let mut root_str = root.to_string_lossy().into_owned();
+    if !root_str.ends_with('\\') {
+        root_str.push('\\');
+    }
+    let wide: Vec<u16> = OsStr::new(&root_str).encode_wide().chain(Some(0)).collect();
+
+    let mut total_bytes = 0u64;
+    let mut free_bytes = 0u64;
+    let mut free_bytes_user = 0u64;
+
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut free_bytes_user),
+            Some(&mut total_bytes),
+            Some(&mut free_bytes),
+        )
+    };
+
+    if result.is_ok() && total_bytes > 0 {
+        Some(total_bytes)
+    } else {
+        None
+    }
+}
+
 /// Check if a file can be recycled
+/// Returns Err(RefuseReason) if the file should not be trashed
+/// Returns Ok(()) if the file passes all pre-checks
 pub fn can_recycle(path: &Path) -> Result<(), RefuseReason> {
-    // 1. Check drive type
+    // All paths go through simplify_path first
+    let simple = simplify_path(path);
+
+    // 1. Check path length after simplification
+    if simple.to_string_lossy().len() > 259 {
+        return Err(RefuseReason::PathTooLong);
+    }
+
+    // 2. Check drive type (uses simplified path)
     let drive_type = get_drive_type(path);
     match drive_type {
-        DRIVE_REMOVABLE | DRIVE_REMOTE | DRIVE_CDROM | DRIVE_RAMDISK | DRIVE_NO_ROOT_DIR => {
+        DRIVE_REMOVABLE | DRIVE_RAMDISK | DRIVE_CDROM | DRIVE_NO_ROOT_DIR => {
+            return Err(RefuseReason::UnsupportedDriveType {
+                drive_type,
+                drive_type_name: drive_type_name(drive_type),
+            });
+        }
+        DRIVE_REMOTE => {
+            // Network drives: UNC paths - refuse
             return Err(RefuseReason::UnsupportedDriveType {
                 drive_type,
                 drive_type_name: drive_type_name(drive_type),
@@ -272,30 +328,42 @@ pub fn can_recycle(path: &Path) -> Result<(), RefuseReason> {
         _ => {} // Other types: allow but warn
     }
 
-    // 2. Get volume GUID
+    // 3. Get volume GUID (uses simplified path)
     let volume_guid = match get_volume_guid(path) {
         Some(g) => g,
         None => return Err(RefuseReason::VolumeGuidNotFound),
     };
 
-    // 3. Check Recycle Bin config
-    let (bin_enabled, max_capacity) = match get_recycle_bin_config(&volume_guid) {
-        Some(cfg) => cfg,
-        None => return Err(RefuseReason::UnknownConfiguration),
-    };
+    // 4. Check Recycle Bin config
+    // HKCU first, then HKLM; missing key = default config (enabled)
+    let (bin_enabled, max_capacity) = get_recycle_bin_config(&volume_guid).unwrap_or((true, 0));
 
     if !bin_enabled {
         return Err(RefuseReason::BinDisabled);
     }
 
-    // 4. Check file size vs capacity
+    // 5. Check file size vs capacity
+    let file_size = std::fs::metadata(&simple).map(|m| m.len()).unwrap_or(0);
+
     if max_capacity > 0 {
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if file_size > max_capacity {
             return Err(RefuseReason::ExceedsCapacity {
                 file_size,
                 max_capacity,
             });
+        }
+    } else {
+        // MaxCapacity unknown → conservative bound: 1% of volume total size
+        // PROPOSED: 1% of volume size as fallback
+        const MAX_FILE_FRACTION: u64 = 100; // 1%
+        if let Some(volume_size) = get_volume_total_size(&simple) {
+            let fallback_capacity = volume_size / MAX_FILE_FRACTION;
+            if file_size > fallback_capacity {
+                return Err(RefuseReason::ExceedsCapacity {
+                    file_size,
+                    max_capacity: fallback_capacity,
+                });
+            }
         }
     }
 

@@ -311,3 +311,48 @@ LOCKED — H7 holds (correctness verified by tests). H8 performance benchmark pe
 
 ### Commit hash
 275177f
+
+---
+
+## F3 — Redo T1b properly (reproducible probe)
+
+### Hypothesis H9
+B (simplified) is recycled and A (verbatim) is not. Alternate outcome "neither recycles" → the bin is disabled/policy-blocked on this machine: record the registry evidence and report to Tyler; do not guess. Record the actual table of results.
+
+### Method
+- Created `examples/trash_probe.rs` (committed, not deleted) that tests:
+  - Two path types: canonicalized (verbatim `\\?\` prefix) and `simplify_path()` result
+  - Two locations: temp dir and user profile temp dir
+  - File sizes: 1KB, 100KB, 1MB, 100MB
+  - Verifies recycling via `SHQueryRecycleBinW` item-count delta AND `trash::os_limited::list()` before/after
+  - Dumps registry recursively for HKCU/HKLM BitBucket and Policy keys
+- Probe runs on throwaway files created in temp dirs
+
+### Result
+**Probe Results (both canonicalized and simplified paths):**
+| File Size | Path Type | Recycle Bin Delta | File Exists After |
+|-----------|-----------|-------------------|-------------------|
+| 1 KB | canonical | 0 | false |
+| 1 KB | simplified | 0 | false |
+| 100 KB | canonical | 0 | false |
+| 100 KB | simplified | 0 | false |
+| 1 MB | canonical | 0 | false |
+| 1 MB | simplified | 0 | false |
+| 100 MB | canonical | 0 | false |
+| 100 MB | simplified | 0 | false |
+
+**Registry Findings:**
+- HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{GUID} EXISTS with NukeOnDelete=0, MaxCapacity={8089, 192820} MB
+- HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket NOT FOUND
+- HKCU/HKLM Policies\Explorer NOT FOUND
+- NoRecycleFiles NOT SET
+
+**Conclusion:** On this machine, `trash::delete()` returns `Ok(())` but PERMANENTLY DELETES files regardless of path format (canonical vs simplified) or size. Recycle Bin is configured and enabled (NukeOnDelete=0), but the `trash` crate implementation doesn't actually recycle on this system.
+
+**H9 Verification:** ALTERNATE OUTCOME - "neither recycles". The bin is enabled but `trash` crate doesn't recycle. Guard must refuse and report.
+
+### Decision
+LOCKED — H9 verified. The `trash` crate on this system permanently deletes all files. Recycle guard must use post-delete verification via `SHQueryRecycleBinW` and disable further deletions if verification fails.
+
+### Commit hash
+a58a34e
