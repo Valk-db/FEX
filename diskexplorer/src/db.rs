@@ -63,6 +63,10 @@ impl SnapshotDb {
                  size INTEGER NOT NULL,
                  PRIMARY KEY (scan_id, path)
              );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_scans_root ON scans(root, started_at);",
         )?;
         Ok(SnapshotDb { conn })
@@ -217,5 +221,23 @@ impl SnapshotDb {
             map.insert(k, v);
         }
         Ok(map)
+    }
+
+    /// Get a setting value
+    pub fn get_setting(&self, key: &str) -> SqlResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM settings WHERE key = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![key], |r| r.get(0))?;
+        rows.next().transpose()
+    }
+
+    /// Set a setting value
+    pub fn set_setting(&mut self, key: &str, value: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }

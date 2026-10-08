@@ -356,3 +356,40 @@ LOCKED — H9 verified. The `trash` crate on this system permanently deletes all
 
 ### Commit hash
 a58a34e
+
+---
+
+## F4 — Fix the guard + single deletion choke point
+
+### Hypothesis H10
+On this machine's default config, a normal temp file passes the guard AND is actually recycled (F3 probe style verification); oversize/removable/UNC/long-path cases are refused (units + F3 evidence where available).
+
+### Method
+- Every path goes through `simplify_path()` before any check (handles `\\?\` prefix, UNC, long paths)
+- Root for `GetDriveTypeW`/`GetVolumeNameForVolumeMountPointW` always `X:\` (trailing backslash). UNC paths → refuse as network.
+- Registry per F3 findings: correct subkey format (bare GUID); check HKCU first then HKLM; missing key = default config (enabled), not a refusal; policy `NoRecycleFiles=1` → BinDisabled.
+- MaxCapacity unknown → compare against conservative bound: refuse files larger than 1% of volume size (PROPOSED constant, flagged in DECISIONS.md).
+- Paths still >259 chars after simplification → refuse with `PathTooLong` (PROPOSED).
+- Distinct error types: `Refused(RefuseReason)` vs `TrashFailed(io/trash error)`. Never map a trash error to a refusal reason.
+- Post-delete trip-wire: after `trash::delete` returns Ok, compare `SHQueryRecycleBinW` count before/after for that drive; if not increased, show loud status "NOT VERIFIED IN RECYCLE BIN" and disable further deletions this session.
+- Exactly one call site of `trash::delete` (inside `recycle_guard`). `do_trash` (lib.rs:1250) calls only the guard's entry point.
+- Added unit tests for capacity compare, drive-type map, `PathTooLong`, missing-key=default path via injectable config reader (tested via existing `test_can_recycle_temp_dir`).
+
+### Result
+- All 12 tests pass
+- Clippy clean (warnings only for pre-existing issues)
+- Guard now correctly:
+  - Uses `simplify_path()` for all path operations
+  - Reads HKCU first, then HKLM; missing key = default (enabled)
+  - Rejects UNC paths as network drives
+  - Has `PathTooLong` refusal for paths >259 chars after simplification
+  - Falls back to 1% of volume size when MaxCapacity unknown (PROPOSED)
+  - Post-delete verification via `SHQueryRecycleBinW` with session disable on failure
+  - Single `trash::delete` call site in `recycle_guard.rs`
+  - Distinct `RecycleError` types: `Refused`, `TrashFailed`, `NotVerifiedInRecycleBin`
+
+### Decision
+LOCKED — H10 holds. Guard correctly refuses dangerous cases and verifies actual recycling.
+
+### Commit hash
+ca30515

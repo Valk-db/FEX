@@ -610,6 +610,11 @@ impl App {
             unreadable_bytes: 0,
         };
 
+        // Load persisted size mode setting
+        if let Ok(Some(val)) = app.db.get_setting("size_mode_logical") {
+            app.size_mode_logical = val == "true";
+        }
+
         // Instant paint: seed everything from the last persisted snapshot,
         // then stream only the diff in the background.
         let baseline: Option<HashMap<PathBuf, (u64, i64)>> =
@@ -1423,6 +1428,8 @@ impl App {
             KeyCode::Char('S') => {
                 // Toggle size mode: logical vs allocated
                 self.size_mode_logical = !self.size_mode_logical;
+                // Persist setting
+                let _ = self.db.set_setting("size_mode_logical", if self.size_mode_logical { "true" } else { "false" });
                 self.rescan(); // Re-scan to update sizes
             }
             KeyCode::Char('t') => self.toggle_strip(),
