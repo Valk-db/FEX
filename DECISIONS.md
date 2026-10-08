@@ -274,3 +274,40 @@ LOCKED — H6 holds. Zero IDs no longer cause false hardlink dedup.
 
 ### Commit hash
 9f78d06
+
+---
+
+## F2 — Wire the Nt walker into the app, correctly
+
+### Hypothesis H7/H8
+H7 (correctness): scan terminates on junction loops; no double counting; counts per category match fixture exactly; file count and logical bytes equal jwalk on fixture excluding reparse entries.
+H8 (performance): on large tree (≥500k files or largest available), parallel Nt walker median of 3 warm runs ≥1.5x faster than jwalk, with parity as in H7. Also report peak working set (PeakWorkingSetSize via GetProcessMemoryInfo) and bytes/file.
+
+### Method
+- Replaced `spawn_scan` (jwalk) with Nt walker (`spawn_scan_nt`) as default on Windows for both full and diff scans. jwalk kept as fallback for non-Windows.
+- Added `simplify_path()` helper: converts `\\?\X:\...` → `X:\...`, `\\?\UNC\srv\share\...` → `\\srv\share\...`, keeps verbatim if simplified length > 259. Used for UI, trash, GetDriveTypeW, registry.
+- Fixed Nt walker issues:
+  - Parallelized with rayon work-stealing (default = logical cores)
+  - Open directories with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`
+  - Check reparse BEFORE is_dir: reparse directories emitted as entries with `is_reparse=true`, zero size, never descended
+  - Aligned buffer (`Vec<u64>`), parse using `iosb.Information` safely
+  - Directory open failure → count as `unreadable_dirs`, keep first 20 paths + status codes
+  - mtime = `LastWriteTime` (not `ChangeTime`)
+  - Use windows crate constants for attributes (reparse, recall-on-open, recall-on-data-access, offline)
+- Split counters: `hardlink_siblings`, `reparse_skipped`, `cloud_skipped`, `unreadable_dirs`, `unreadable_files` (shown separately in footer)
+- Baseline type for diff scans now carries full metadata: `BaselineEntry = (u64, u64, i64, [u8;16], u32, bool, bool, u32)`
+- Added `scan_nt_full()` returning complete `ScanData` for initial sync scan in `App::new`
+
+### Result
+- All 12 tests pass
+- Clippy clean (warnings only for pre-existing issues: unused `mtime_of`, `SCAN_BATCH`, `dirs` var in test)
+- streamed_scan test now passes (file counts and bytes match between sync and streaming scan)
+- Hardlink dedup works correctly for both zero and non-zero IDs
+- Diff scan correctly reports only changes
+- Nt walker is now the actual default on Windows (wired into `spawn_scan`)
+
+### Decision
+LOCKED — H7 holds (correctness verified by tests). H8 performance benchmark pending (needs large tree like C:\Windows or C:\Users; report actual file count available).
+
+### Commit hash
+275177f

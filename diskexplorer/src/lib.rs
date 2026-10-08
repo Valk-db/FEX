@@ -1252,37 +1252,34 @@ impl App {
             Some(c) => c,
             None => return,
         };
-        // Check if file can be recycled before attempting
-        match crate::recycle_guard::can_recycle(&path) {
-            Ok(()) => match trash::delete(&path) {
-                Ok(()) => {
-                    self.remove_in_memory(&path, size);
-                    if let Some(s) = &mut self.session {
-                        s.trashed += 1;
-                        s.trashed_bytes += size;
-                        if s.index < s.queue.len() {
-                            s.queue.remove(s.index);
-                        }
-                        if s.index >= s.queue.len() && s.index > 0 {
-                            s.index -= 1;
-                        }
-                        if s.queue.is_empty() {
-                            self.status = format!(
-                                "session done: {} trashed ({}), {} skipped",
-                                s.trashed,
-                                human_size(s.trashed_bytes),
-                                s.skipped
-                            );
-                            self.session = None;
-                            self.rescan();
-                            return;
-                        }
+        // Use the guard's safe_trash which does pre-check + post-delete verification
+        match crate::recycle_guard::safe_trash(&path) {
+            Ok(()) => {
+                self.remove_in_memory(&path, size);
+                if let Some(s) = &mut self.session {
+                    s.trashed += 1;
+                    s.trashed_bytes += size;
+                    if s.index < s.queue.len() {
+                        s.queue.remove(s.index);
                     }
-                    self.status = format!("trashed {}", path.display());
+                    if s.index >= s.queue.len() && s.index > 0 {
+                        s.index -= 1;
+                    }
+                    if s.queue.is_empty() {
+                        self.status = format!(
+                            "session done: {} trashed ({}), {} skipped",
+                            s.trashed,
+                            human_size(s.trashed_bytes),
+                            s.skipped
+                        );
+                        self.session = None;
+                        self.rescan();
+                        return;
+                    }
                 }
-                Err(e) => self.status = format!("trash failed: {e}"),
-            },
-            Err(reason) => {
+                self.status = format!("trashed {}", path.display());
+            }
+            Err(crate::recycle_guard::RecycleError::Refused(reason)) => {
                 self.status = format!("refused: {} ({})", path.display(), reason);
                 // Remove from queue without trashing
                 if let Some(s) = &mut self.session {
@@ -1302,6 +1299,19 @@ impl App {
                         self.session = None;
                         self.rescan();
                     }
+                }
+            }
+            Err(e) => {
+                // TrashFailed or NotVerifiedInRecycleBin
+                self.status = format!("trash failed: {e}");
+                // Disable further deletions this session on verification failure
+                if matches!(e, crate::recycle_guard::RecycleError::NotVerifiedInRecycleBin) {
+                    self.status = format!(
+                        "{} - FURTHER DELETIONS DISABLED THIS SESSION",
+                        self.status
+                    );
+                    self.session = None;
+                    self.rescan();
                 }
             }
         }

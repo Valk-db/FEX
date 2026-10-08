@@ -3,15 +3,23 @@
 //! On Windows, the `trash` crate may permanently delete files instead of recycling them
 //! in certain conditions (disabled bin, file too large, removable/network drive).
 //! This module implements a pre-check before calling `trash::delete()`.
+//!
+//! Key findings from F3 probe:
+//! - Registry is in HKCU (not HKLM), subkey is bare GUID (not Volume\GUID)
+//! - MaxCapacity is in MB (e.g., 8089 = ~8GB, 192820 = ~188GB)
+//! - NukeOnDelete=0 means enabled
+//! - trash::delete() returns Ok(()) but PERMANENTLY DELETES on this system
+//! - Post-delete verification via SHQueryRecycleBinW is required
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
+use crate::nt_walker::simplify_path;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeNameForVolumeMountPointW};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -97,9 +105,15 @@ fn human_size(n: u64) -> String {
 }
 
 /// Get the drive type for a path
+/// Uses simplify_path to handle verbatim paths (\\?\ prefix) correctly
 fn get_drive_type(path: &Path) -> u32 {
-    let root = path.components().next().unwrap().as_os_str();
-    let wide: Vec<u16> = root.encode_wide().chain(Some(0)).collect();
+    let simple = simplify_path(path);
+    let root = simple.components().next().unwrap().as_os_str();
+    let mut root_str = root.to_string_lossy().into_owned();
+    if !root_str.ends_with('\\') {
+        root_str.push('\\');
+    }
+    let wide: Vec<u16> = OsStr::new(&root_str).encode_wide().chain(Some(0)).collect();
     unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) }
 }
 
@@ -147,8 +161,8 @@ fn get_volume_guid(path: &Path) -> Option<String> {
 }
 
 /// Check if Recycle Bin is enabled and get max capacity for a volume
+/// Checks HKCU first (per F3 findings), then HKLM. Subkey is bare GUID.
 fn get_recycle_bin_config(volume_guid: &str) -> Option<(bool, u64)> {
-    // Registry path: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\<GUID>
     // Remove the leading \\?\ and trailing \
     let guid = volume_guid
         .trim_start_matches("\\\\?\\")
@@ -160,70 +174,79 @@ fn get_recycle_bin_config(volume_guid: &str) -> Option<(bool, u64)> {
 
     let subkey_wide: Vec<u16> = OsStr::new(&subkey).encode_wide().chain(Some(0)).collect();
 
-    let mut hkey = HKEY::default();
-    let result = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey_wide.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-    };
+    // Try HKCU first, then HKLM
+    let hives = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE];
+    let mut bin_enabled = false;
+    let mut max_capacity_mb = 0u32;
+    let mut found = false;
 
-    if result != ERROR_SUCCESS {
-        return None;
+    for &hive in &hives {
+        let mut hkey = HKEY::default();
+        let result = unsafe {
+            RegOpenKeyExW(
+                hive,
+                PCWSTR(subkey_wide.as_ptr()),
+                Some(0),
+                KEY_READ,
+                &mut hkey,
+            )
+        };
+
+        if result != ERROR_SUCCESS {
+            continue;
+        }
+        found = true;
+
+        // Read NukeOnDelete (1 = bin disabled, 0 = enabled)
+        let mut nuke_on_delete = 0u32;
+        let mut cb_data = std::mem::size_of::<u32>() as u32;
+        let nuke_name: Vec<u16> = OsStr::new("NukeOnDelete")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(nuke_name.as_ptr()),
+                None,
+                None,
+                Some(&mut nuke_on_delete as *mut _ as *mut u8),
+                Some(&mut cb_data),
+            )
+        };
+
+        if result == ERROR_SUCCESS {
+            bin_enabled = nuke_on_delete == 0;
+        }
+
+        // Read MaxCapacity (in MB on Windows 10+)
+        let mut cb_data = std::mem::size_of::<u32>() as u32;
+        let max_name: Vec<u16> = OsStr::new("MaxCapacity")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe {
+            RegQueryValueExW(
+                hkey,
+                PCWSTR(max_name.as_ptr()),
+                None,
+                None,
+                Some(&mut max_capacity_mb as *mut _ as *mut u8),
+                Some(&mut cb_data),
+            )
+        };
+
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        };
+
+        if result == ERROR_SUCCESS {
+            break; // Found capacity
+        }
     }
 
-    // Read NukeOnDelete (1 = bin disabled, 0 = enabled)
-    let mut nuke_on_delete = 0u32;
-    let mut cb_data = std::mem::size_of::<u32>() as u32;
-    let nuke_name: Vec<u16> = OsStr::new("NukeOnDelete")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let result = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(nuke_name.as_ptr()),
-            None,
-            None,
-            Some(&mut nuke_on_delete as *mut _ as *mut u8),
-            Some(&mut cb_data),
-        )
-    };
-
-    let bin_enabled = if result == ERROR_SUCCESS {
-        nuke_on_delete == 0
-    } else {
-        // Default: assume enabled if key not found
-        true
-    };
-
-    // Read MaxCapacity (in MB on Windows 10+)
-    let mut max_capacity_mb = 0u32;
-    let mut cb_data = std::mem::size_of::<u32>() as u32;
-    let max_name: Vec<u16> = OsStr::new("MaxCapacity")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let result = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(max_name.as_ptr()),
-            None,
-            None,
-            Some(&mut max_capacity_mb as *mut _ as *mut u8),
-            Some(&mut cb_data),
-        )
-    };
-
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    };
-
-    if result != ERROR_SUCCESS {
-        return Some((bin_enabled, 0)); // Unknown capacity
+    if !found {
+        return None;
     }
 
     // MaxCapacity is in MB on Windows 10+
@@ -280,9 +303,100 @@ pub fn can_recycle(path: &Path) -> Result<(), RefuseReason> {
 }
 
 /// Try to delete a file via Recycle Bin, with guard
-pub fn safe_trash(path: &Path) -> Result<(), RefuseReason> {
-    can_recycle(path)?;
-    trash::delete(path).map_err(|_| RefuseReason::UnknownConfiguration)
+/// Returns:
+/// - Ok(()) if file was recycled and verified
+/// - Err(RefuseReason) if guard refused
+/// - Err(TrashFailed) if trash::delete failed or post-delete verification failed
+pub fn safe_trash(path: &Path) -> Result<(), RecycleError> {
+    // Pre-check
+    can_recycle(path).map_err(RecycleError::Refused)?;
+
+    // Get drive root for post-delete verification
+    let simple = simplify_path(path);
+    let root = simple.components().next().unwrap().as_os_str();
+    let mut root_str = root.to_string_lossy().into_owned();
+    if !root_str.ends_with('\\') {
+        root_str.push('\\');
+    }
+
+    // Get recycle bin count before
+    let before_count = query_recycle_bin_count(&root_str);
+
+    // Try to trash
+    trash::delete(path).map_err(|e| RecycleError::TrashFailed(e.to_string()))?;
+
+    // Post-delete verification: check recycle bin count increased
+    let after_count = query_recycle_bin_count(&root_str);
+    if after_count <= before_count {
+        // Recycle bin count didn't increase - file was permanently deleted!
+        // This is a critical failure
+        return Err(RecycleError::NotVerifiedInRecycleBin);
+    }
+
+    Ok(())
+}
+
+/// Recycle error types - distinct from refusal reasons
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecycleError {
+    Refused(RefuseReason),
+    TrashFailed(String),
+    NotVerifiedInRecycleBin,
+}
+
+impl std::fmt::Display for RecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecycleError::Refused(reason) => write!(f, "Refused: {reason}"),
+            RecycleError::TrashFailed(e) => write!(f, "Trash operation failed: {e}"),
+            RecycleError::NotVerifiedInRecycleBin => {
+                write!(f, "NOT VERIFIED IN RECYCLE BIN - file was permanently deleted!")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecycleError {}
+
+/// Query recycle bin item count for a drive root
+fn query_recycle_bin_count(root_path: &str) -> u64 {
+    use std::process::Command;
+
+    let output = Command::new("powershell")
+        .args([
+            "-Command",
+            &format!(
+                r#"
+                Add-Type -TypeDefinition @"
+                using System;
+                using System.Runtime.InteropServices;
+                public class RecycleBin {{
+                    [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
+                    public static extern int SHQueryRecycleBinW(string pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);
+                }}
+                [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+                public struct SHQUERYRBINFO {{
+                    public int cbSize;
+                    public long i64Size;
+                    public long i64NumItems;
+                }}
+"@
+                $info = New-Object RecycleBin+SHQUERYRBINFO
+                $info.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($info)
+                $result = [RecycleBin]::SHQueryRecycleBinW('{root_path}', [ref]$info)
+                if ($result -eq 0) {{ $info.i64NumItems }} else {{ 0 }}
+                "#
+            ),
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.trim().parse().unwrap_or(0)
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
