@@ -40,7 +40,7 @@ pub fn simplify_path(path: &Path) -> PathBuf {
             }
             return p;
         } else {
-            let mut p = PathBuf::from(stripped);
+            let p = PathBuf::from(stripped);
             if p.to_string_lossy().len() > 259 {
                 return path.to_path_buf();
             }
@@ -162,7 +162,7 @@ fn read_dir_nt(dir: &Path, volume_serial: u32) -> (Vec<NtEntry>, Vec<(PathBuf, N
 
         // Parse the buffer - FILE_ID_EXTD_DIR_INFORMATION structures
         let mut offset = 0;
-        while offset < iosb.Information as usize {
+        while offset < iosb.Information {
             // SAFETY: buffer is properly aligned for FILE_ID_EXTD_DIR_INFORMATION
             // and we only read within the valid range returned by iosb.Information
             let info = unsafe {
@@ -294,15 +294,16 @@ pub fn scan_nt_full(root: &Path) -> std::io::Result<ScanData> {
     })
 }
 
-/// Internal implementation shared by scan_nt and scan_nt_full
-fn scan_nt_internal(
-    root: &Path,
-) -> std::io::Result<(
+/// Internal scan results type
+type InternalScanResult = (
     ScanResult,
     std::collections::HashMap<PathBuf, u64>,
     std::collections::HashMap<PathBuf, u64>,
     Vec<FileRecord>,
-)> {
+);
+
+/// Internal implementation shared by scan_nt and scan_nt_full
+fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let root = root.canonicalize()?;
     let volume_serial = get_volume_serial(&root);
 
@@ -574,15 +575,15 @@ pub fn spawn_scan_nt(
                                 }
                                 let unchanged = base
                                     .get(&key)
-                                    .map(|(ls, als, m, fid, vs, irp, icl, rpt)| {
-                                        *ls == val.0
-                                            && *als == val.1
-                                            && *m == val.2
-                                            && *fid == val.3
-                                            && *vs == val.4
-                                            && *irp == val.5
-                                            && *icl == val.6
-                                            && *rpt == val.7
+                                    .map(|entry| {
+                                        entry.logical_size == val.0
+                                            && entry.allocated_size == val.1
+                                            && entry.mtime == val.2
+                                            && entry.file_id == val.3
+                                            && entry.volume_serial == val.4
+                                            && entry.is_reparse == val.5
+                                            && entry.is_cloud == val.6
+                                            && entry.reparse_tag == val.7
                                     })
                                     .unwrap_or(false);
                                 if !unchanged {
@@ -669,10 +670,9 @@ pub fn spawn_scan_nt(
                 let deleted: Vec<(PathBuf, u64)> = base
                     .iter()
                     .filter(|(p, _)| !seen_paths.contains(*p))
-                    .map(|(p, (ls, _, _, _, _, _, _, _))| (p.clone(), *ls))
+                    .map(|(p, entry)| (p.clone(), entry.logical_size))
                     .collect();
                 if !deleted.is_empty() && tx.send(NtScanEvent::Deleted(deleted)).is_err() {
-                    return;
                 }
             }
         }

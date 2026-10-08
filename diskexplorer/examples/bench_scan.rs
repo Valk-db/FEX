@@ -2,10 +2,12 @@
 //!
 //! Run with: cargo run --example bench_scan -- <path>
 //! Compares jwalk (current) vs NtQueryDirectoryFileEx walker.
+//! Each walker runs in a separate process for accurate peak working set measurement.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use jwalk::WalkDir;
@@ -13,9 +15,7 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFORMATION, FILE_INFORMATION_CLASS, FileIdExtdDirectoryInformation,
     NtQueryDirectoryFileEx,
 };
-use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, HANDLE, NTSTATUS, STATUS_NO_MORE_FILES,
-};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, NTSTATUS, STATUS_NO_MORE_FILES};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -32,88 +32,86 @@ struct ScanResult {
     file_count: u64,
     dir_count: u64,
     total_logical_bytes: u64,
+    peak_working_set_mb: f64,
+    bytes_per_file: f64,
 }
 
-// Entry data collected by Nt walker
+// Entry data collected by Nt walker (used in child process)
 #[derive(Debug, Clone)]
 struct NtEntry {
     path: PathBuf,
     is_dir: bool,
     logical_size: u64,
-    allocated_size: u64,
-    file_id: [u8; 16],
-    attributes: u32,
-    reparse_tag: u32,
-    mtime: i64,
 }
 
-// Run jwalk scan
+// Run jwalk scan in a separate process for accurate memory measurement
 fn scan_jwalk(root: &Path) -> ScanResult {
-    let start = Instant::now();
-    let mut file_count = 0u64;
-    let mut dir_count = 0u64;
-    let mut total_logical = 0u64;
+    let root_str = root.to_string_lossy().to_string();
+    let exe = std::env::current_exe().unwrap();
+    let output = Command::new(&exe)
+        .args(["--jwalk", &root_str])
+        .output()
+        .expect("Failed to run jwalk child process");
 
-    for entry in WalkDir::new(root).skip_hidden(false) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if entry.file_type().is_dir() {
-            dir_count += 1;
-        } else if entry.file_type().is_file() {
-            file_count += 1;
-            if let Ok(meta) = entry.metadata() {
-                total_logical += meta.len();
-            }
-        }
+    if !output.status.success() {
+        eprintln!("jwalk child failed: {}", String::from_utf8_lossy(&output.stderr));
+        std::process::exit(1);
     }
 
-    ScanResult {
-        walker: "jwalk".to_string(),
-        run: 0,
-        wall_ms: start.elapsed().as_millis() as u64,
-        file_count,
-        dir_count,
-        total_logical_bytes: total_logical,
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_scan_result(&stdout, "jwalk")
 }
 
-// Run Nt walker scan
+// Run Nt walker scan in a separate process for accurate memory measurement
 fn scan_nt(root: &Path) -> ScanResult {
-    let start = Instant::now();
-    let mut file_count = 0u64;
-    let mut dir_count = 0u64;
-    let mut total_logical = 0u64;
+    let root_str = root.to_string_lossy().to_string();
+    let exe = std::env::current_exe().unwrap();
+    let output = Command::new(&exe)
+        .args(["--nt", &root_str])
+        .output()
+        .expect("Failed to run NT walker child process");
 
-    // Use a work queue for parallel directory traversal
-    let mut dirs_to_process: Vec<PathBuf> = vec![root.to_path_buf()];
-
-    while let Some(dir) = dirs_to_process.pop() {
-        let entries = read_dir_nt(&dir);
-        for entry in entries {
-            if entry.is_dir {
-                dirs_to_process.push(entry.path.clone());
-                dir_count += 1;
-            } else {
-                file_count += 1;
-                total_logical += entry.logical_size;
-            }
-        }
+    if !output.status.success() {
+        eprintln!("NT walker child failed: {}", String::from_utf8_lossy(&output.stderr));
+        std::process::exit(1);
     }
 
-    ScanResult {
-        walker: "nt".to_string(),
-        run: 0,
-        wall_ms: start.elapsed().as_millis() as u64,
-        file_count,
-        dir_count,
-        total_logical_bytes: total_logical,
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_scan_result(&stdout, "nt")
 }
 
-// Read a single directory using NtQueryDirectoryFileEx
+fn parse_scan_result(stdout: &str, walker: &str) -> ScanResult {
+    let mut result = ScanResult {
+        walker: walker.to_string(),
+        run: 0,
+        wall_ms: 0,
+        file_count: 0,
+        dir_count: 0,
+        total_logical_bytes: 0,
+        peak_working_set_mb: 0.0,
+        bytes_per_file: 0.0,
+    };
+
+    for line in stdout.lines() {
+        if line.starts_with("RESULT,") {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 6 {
+                result.wall_ms = parts[1].parse().unwrap_or(0);
+                result.file_count = parts[2].parse().unwrap_or(0);
+                result.dir_count = parts[3].parse().unwrap_or(0);
+                result.total_logical_bytes = parts[4].parse().unwrap_or(0);
+                result.peak_working_set_mb = parts[5].parse().unwrap_or(0.0);
+                if parts.len() > 6 {
+                    result.bytes_per_file = parts[6].parse().unwrap_or(0.0);
+                }
+            }
+            break; // Found it, stop parsing
+        }
+    }
+    result
+}
+
+// Read a single directory using NtQueryDirectoryFileEx (used by NT walker child process)
 fn read_dir_nt(dir: &Path) -> Vec<NtEntry> {
     let mut results = Vec::new();
 
@@ -154,7 +152,7 @@ fn read_dir_nt(dir: &Path) -> Vec<NtEntry> {
             )
         };
 
-        if status == NTSTATUS(STATUS_NO_MORE_FILES.0 as i32) {
+        if status == STATUS_NO_MORE_FILES {
             break;
         }
         if status != NTSTATUS(0) {
@@ -181,34 +179,13 @@ fn read_dir_nt(dir: &Path) -> Vec<NtEntry> {
 
                     let is_dir = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
 
-                    // EndOfFile and AllocationSize are i64 (LARGE_INTEGER)
+                    // EndOfFile is i64 (LARGE_INTEGER)
                     let logical_size = info.EndOfFile as u64;
-                    let allocated_size = info.AllocationSize as u64;
-
-                    // File ID is 128-bit
-                    let mut file_id = [0u8; 16];
-                    file_id.copy_from_slice(&info.FileId.Identifier);
-
-                    // Mtime from ChangeTime (100ns intervals since 1601)
-                    let mtime_100ns = info.ChangeTime as u64;
-                    // Convert to Unix epoch (seconds)
-                    const WINDOWS_TICKS_PER_SEC: u64 = 10_000_000;
-                    const WINDOWS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000_000; // 100ns intervals from 1601 to 1970
-                    let mtime_unix = if mtime_100ns > WINDOWS_TO_UNIX_EPOCH {
-                        ((mtime_100ns - WINDOWS_TO_UNIX_EPOCH) / WINDOWS_TICKS_PER_SEC) as i64
-                    } else {
-                        0
-                    };
 
                     results.push(NtEntry {
                         path,
                         is_dir,
                         logical_size,
-                        allocated_size,
-                        file_id,
-                        attributes: info.FileAttributes,
-                        reparse_tag: info.ReparsePointTag,
-                        mtime: mtime_unix,
                     });
                 }
             }
@@ -220,8 +197,105 @@ fn read_dir_nt(dir: &Path) -> Vec<NtEntry> {
         }
     }
 
-    unsafe { CloseHandle(dir_handle) };
+    let _ = unsafe { CloseHandle(dir_handle) };
     results
+}
+
+// Child process entry point for jwalk scan
+fn run_jwalk_child(root: &Path) -> ScanResult {
+    let start = Instant::now();
+    let mut file_count = 0u64;
+    let mut dir_count = 0u64;
+    let mut total_logical = 0u64;
+
+    for entry in WalkDir::new(root).skip_hidden(false) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.file_type().is_dir() {
+            dir_count += 1;
+        } else if entry.file_type().is_file() {
+            file_count += 1;
+            if let Ok(meta) = entry.metadata() {
+                total_logical += meta.len();
+            }
+        }
+    }
+
+    let peak_mb = get_peak_working_set_mb();
+    let bytes_per_file = if file_count > 0 { total_logical as f64 / file_count as f64 } else { 0.0 };
+
+    ScanResult {
+        walker: "jwalk".to_string(),
+        run: 0,
+        wall_ms: start.elapsed().as_millis() as u64,
+        file_count,
+        dir_count,
+        total_logical_bytes: total_logical,
+        peak_working_set_mb: peak_mb,
+        bytes_per_file,
+    }
+}
+
+// Child process entry point for NT walker scan
+fn run_nt_child(root: &Path) -> ScanResult {
+    let start = Instant::now();
+    let mut file_count = 0u64;
+    let mut dir_count = 0u64;
+    let mut total_logical = 0u64;
+
+    // Use a work queue for parallel directory traversal
+    let mut dirs_to_process: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = dirs_to_process.pop() {
+        let entries = read_dir_nt(&dir);
+        for entry in entries {
+            if entry.is_dir {
+                dirs_to_process.push(entry.path.clone());
+                dir_count += 1;
+            } else {
+                file_count += 1;
+                total_logical += entry.logical_size;
+            }
+        }
+    }
+
+    let peak_mb = get_peak_working_set_mb();
+    let bytes_per_file = if file_count > 0 { total_logical as f64 / file_count as f64 } else { 0.0 };
+
+    ScanResult {
+        walker: "nt".to_string(),
+        run: 0,
+        wall_ms: start.elapsed().as_millis() as u64,
+        file_count,
+        dir_count,
+        total_logical_bytes: total_logical,
+        peak_working_set_mb: peak_mb,
+        bytes_per_file,
+    }
+}
+
+/// Get peak working set size in MB
+fn get_peak_working_set_mb() -> f64 {
+    let mut pmc = windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+
+    let result = unsafe {
+        windows::Win32::System::ProcessStatus::GetProcessMemoryInfo(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            &mut pmc as *mut _ as *mut _,
+            std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    };
+
+    if result.is_ok() {
+        pmc.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+    } else {
+        0.0
+    }
 }
 
 fn run_benchmark(root: &Path, runs: u32) -> Vec<ScanResult> {
@@ -272,6 +346,22 @@ fn run_benchmark(root: &Path, runs: u32) -> Vec<ScanResult> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Child process entry points
+    if args.len() >= 2 && args[1] == "--jwalk" {
+        let root = PathBuf::from(&args[2]);
+        let result = run_jwalk_child(&root);
+        print_result(&result);
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--nt" {
+        let root = PathBuf::from(&args[2]);
+        let result = run_nt_child(&root);
+        print_result(&result);
+        return;
+    }
+
+    // Parent process
     let path = if args.len() > 1 {
         PathBuf::from(&args[1])
     } else {
@@ -306,6 +396,8 @@ fn main() {
         println!("  Files:           {}", cold.file_count);
         println!("  Dirs:            {}", cold.dir_count);
         println!("  Logical bytes:   {}", cold.total_logical_bytes);
+        println!("  Peak working set: {:.1} MB", cold.peak_working_set_mb);
+        println!("  Bytes/file (avg file size): {:.1}", cold.bytes_per_file);
 
         if walker == "jwalk" {
             // Check if NT walker matches
@@ -353,4 +445,17 @@ fn main() {
             }
         }
     }
+}
+
+fn print_result(result: &ScanResult) {
+    // Print in format: RESULT,wall_ms,file_count,dir_count,total_logical_bytes,peak_working_set_mb,bytes_per_file
+    println!(
+        "RESULT,{},{},{},{},{:.1},{:.1}",
+        result.wall_ms,
+        result.file_count,
+        result.dir_count,
+        result.total_logical_bytes,
+        result.peak_working_set_mb,
+        result.bytes_per_file
+    );
 }

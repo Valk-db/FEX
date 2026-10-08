@@ -3,12 +3,21 @@
 //! Tests whether trash::delete() actually recycles files on this system,
 //! comparing canonicalized (verbatim) paths vs simplified paths.
 
+use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
-use std::process::Command;
 
 use diskexplorer::nt_walker::simplify_path;
+use diskexplorer::recycle_guard::recycle_bin_item_count;
+#[allow(clippy::single_component_path_imports)]
+use trash;
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
+    RegEnumKeyExW, RegCloseKey,
+};
+use windows::Win32::Foundation::{WIN32_ERROR, ERROR_SUCCESS};
+use windows::core::{PCWSTR, PWSTR};
 
 fn main() {
     println!("=== Trash Probe ===\n");
@@ -58,12 +67,15 @@ fn run_probe(dir: &Path) {
         // Verify file exists
         assert!(file_path.exists(), "File should exist after creation");
 
+        // Get recycle bin list before (for verification)
+        let _list_before = trash::os_limited::list().unwrap();
+
         // Test A: canonicalized path (verbatim, \\?\ prefix)
         let canonical = file_path.canonicalize().unwrap();
         println!("    Canonical path: {}", canonical.display());
 
         // Get recycle bin count before
-        let before_count = get_recycle_bin_count(&canonical);
+        let before_count = recycle_bin_item_count(&canonical.to_string_lossy()).unwrap_or(0);
         println!("    Recycle bin count before: {}", before_count);
 
         // Try to trash with canonical path
@@ -75,9 +87,14 @@ fn run_probe(dir: &Path) {
         println!("    File exists after: {}", exists_after_a);
 
         // Get recycle bin count after
-        let after_count = get_recycle_bin_count(&canonical);
+        let after_count = recycle_bin_item_count(&canonical.to_string_lossy()).unwrap_or(0);
         println!("    Recycle bin count after: {}", after_count);
         println!("    Delta: {}", after_count.saturating_sub(before_count));
+
+        // Check if file is in os_limited::list()
+        let list_after_a = trash::os_limited::list().unwrap();
+        let found_in_list_a = list_after_a.iter().any(|i| i.original_path() == canonical);
+        println!("    Found in os_limited::list(): {}", found_in_list_a);
 
         // Test B: simplified path (if file still exists, re-create it)
         let file_path_b = dir.join(format!("{}_b", name));
@@ -88,7 +105,7 @@ fn run_probe(dir: &Path) {
         let simplified = simplify_path(&file_path_b);
         println!("    Simplified path: {}", simplified.display());
 
-        let before_count_b = get_recycle_bin_count(&simplified);
+        let before_count_b = recycle_bin_item_count(&simplified.to_string_lossy()).unwrap_or(0);
         println!("    Recycle bin count before: {}", before_count_b);
 
         let result_b = trash::delete(&simplified);
@@ -97,9 +114,14 @@ fn run_probe(dir: &Path) {
         let exists_after_b = simplified.exists();
         println!("    File exists after: {}", exists_after_b);
 
-        let after_count_b = get_recycle_bin_count(&simplified);
+        let after_count_b = recycle_bin_item_count(&simplified.to_string_lossy()).unwrap_or(0);
         println!("    Recycle bin count after: {}", after_count_b);
         println!("    Delta: {}", after_count_b.saturating_sub(before_count_b));
+
+        // Check if file is in os_limited::list()
+        let list_after_b = trash::os_limited::list().unwrap();
+        let found_in_list_b = list_after_b.iter().any(|i| i.original_path() == simplified);
+        println!("    Found in os_limited::list(): {}", found_in_list_b);
 
         // Cleanup
         let _ = fs::remove_file(&file_path);
@@ -107,154 +129,97 @@ fn run_probe(dir: &Path) {
     }
 }
 
-fn get_recycle_bin_count(path: &Path) -> u64 {
-    // Get drive root for SHQueryRecycleBinW
-    let root = path.components().next().unwrap().as_os_str();
-    let mut root_str = root.to_string_lossy().into_owned();
-    if !root_str.ends_with('\\') {
-        root_str.push('\\');
-    }
-
-    // Use SHQueryRecycleBinW via PowerShell
-    let output = Command::new("powershell")
-        .args([
-            "-Command",
-            &format!(
-                r#"
-                Add-Type -TypeDefinition @"
-                using System;
-                using System.Runtime.InteropServices;
-                public class RecycleBin {{
-                    [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
-                    public static extern int SHQueryRecycleBinW(string pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);
-                }}
-                [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-                public struct SHQUERYRBINFO {{
-                    public int cbSize;
-                    public long i64Size;
-                    public long i64NumItems;
-                }}
-"@
-                $info = New-Object RecycleBin+SHQUERYRBINFO
-                $info.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($info)
-                $result = [RecycleBin]::SHQueryRecycleBinW('{root_str}', [ref]$info)
-                if ($result -eq 0) {{ $info.i64NumItems }} else {{ -1 }}
-                "#
-            ),
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.trim().parse().unwrap_or(0)
-        }
-        _ => 0,
-    }
-}
-
 fn dump_registry() {
-    use std::process::Command;
-
     let hives = vec![
-        ("HKCU", r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
-        ("HKLM", r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
+        ("HKCU", HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
+        ("HKLM", HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
         (
             "HKCU_Policies",
-            r"HKCU:\Software\Policies\Microsoft\Windows\Explorer",
+            HKEY_CURRENT_USER,
+            r"SOFTWARE\Policies\Microsoft\Windows\Explorer",
         ),
         (
             "HKLM_Policies",
-            r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer",
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Policies\Microsoft\Windows\Explorer",
         ),
     ];
 
-    for (label, key) in hives {
-        println!("\n  {label}: {key}");
-        let output = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    r#"
-                    if (Test-Path '{key}') {{
-                        Get-ChildItem '{key}' -Recurse -ErrorAction SilentlyContinue |
-                        ForEach-Object {{
-                            $props = @{{}}
-                            foreach ($name in $_.Property) {{
-                                $props[$name] = $_.GetValue($name)
-                            }}
-                            [pscustomobject]@{{
-                                Path = $_.PSPath
-                                Name = $_.PSChildName
-                                Props = $props
-                            }}
-                        }} | Format-List
-                    }} else {{
-                        Write-Host "  Key not found"
-                    }}
-                    "#
-                ),
-            ])
-            .output();
+    for (label, hive, key_path) in hives {
+        println!("\n  {label}: {hive:?} {key_path}");
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with("PSPath") {
-                        println!("    {line}");
+        let key_wide: Vec<u16> = std::ffi::OsStr::new(key_path).encode_wide().chain(Some(0)).collect();
+        let mut hkey = HKEY::default();
+        let result = unsafe {
+            RegOpenKeyExW(hive, PCWSTR(key_wide.as_ptr()), Some(0), KEY_READ, &mut hkey)
+        };
+
+        if result != ERROR_SUCCESS {
+            println!("    Key not found (error {})", result.0);
+            continue;
+        }
+
+        // Enumerate subkeys
+        let mut index = 0u32;
+        loop {
+            let mut name_buf = [0u16; 256];
+            let mut name_len = name_buf.len() as u32;
+            let result = unsafe {
+                RegEnumKeyExW(
+                    hkey,
+                    index,
+                    Some(PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+            if result == WIN32_ERROR(259u32) { // ERROR_NO_MORE_ITEMS
+                break;
+            }
+            if result != ERROR_SUCCESS {
+                break;
+            }
+
+            let subkey_name = OsString::from_wide(&name_buf[..name_len as usize]).to_string_lossy().into_owned();
+
+            // Open subkey and read values
+            let subkey_path = format!("{}\\{}", key_path, subkey_name);
+            let subkey_wide: Vec<u16> = std::ffi::OsStr::new(&subkey_path).encode_wide().chain(Some(0)).collect();
+            let mut sub_hkey = HKEY::default();
+            let result = unsafe {
+                RegOpenKeyExW(hive, PCWSTR(subkey_wide.as_ptr()), Some(0), KEY_READ, &mut sub_hkey)
+            };
+
+            if result == ERROR_SUCCESS {
+                // Read NukeOnDelete and MaxCapacity
+                for value_name in ["NukeOnDelete", "MaxCapacity", "NoRecycleFiles"] {
+                    let value_wide: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
+                    let mut value = 0u32;
+                    let mut value_size = std::mem::size_of::<u32>() as u32;
+                    let result = unsafe {
+                        RegQueryValueExW(
+                            sub_hkey,
+                            PCWSTR(value_wide.as_ptr()),
+                            None,
+                            None,
+                            Some(&mut value as *mut _ as *mut u8),
+                            Some(&mut value_size),
+                        )
+                    };
+                    if result == ERROR_SUCCESS {
+                        println!("    {}: {} = {}", subkey_name, value_name, value);
                     }
                 }
+                unsafe { let _ = RegCloseKey(sub_hkey); }
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                println!("    Error: {stderr}");
-            }
-            Err(e) => {
-                println!("    Failed to run: {e}");
-            }
-        }
-    }
 
-    // Also check NoRecycleFiles
-    for (label, key) in [
-        ("HKCU_NoRecycleFiles", r"HKCU:\Software\Policies\Microsoft\Windows\Explorer"),
-        ("HKLM_NoRecycleFiles", r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"),
-    ] {
-        let output = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    r#"
-                    if (Test-Path '{key}') {{
-                        Get-ItemProperty '{key}' -Name 'NoRecycleFiles' -ErrorAction SilentlyContinue | Format-List
-                    }} else {{
-                        Write-Host "  Key not found"
-                    }}
-                    "#
-                ),
-            ])
-            .output();
-
-        println!("\n  {label}:");
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() {
-                        println!("    {line}");
-                    }
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                println!("    Error: {stderr}");
-            }
-            Err(e) => {
-                println!("    Failed to run: {e}");
-            }
+            index += 1;
         }
+
+        unsafe { let _ = RegCloseKey(hkey); }
     }
 }
