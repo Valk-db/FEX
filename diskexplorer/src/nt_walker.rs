@@ -11,9 +11,7 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFORMATION, FILE_INFORMATION_CLASS, FileIdExtdDirectoryInformation,
     NtQueryDirectoryFileEx,
 };
-use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, NTSTATUS, STATUS_NO_MORE_FILES,
-};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, NTSTATUS, STATUS_NO_MORE_FILES};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -140,7 +138,8 @@ fn read_dir_nt(dir: &Path, volume_serial: u32) -> Vec<NtEntry> {
 
                     let is_dir = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
                     let is_reparse = (info.FileAttributes & 0x400) != 0; // FILE_ATTRIBUTE_REPARSE_POINT
-                    let is_cloud = (info.FileAttributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+                    let is_cloud = (info.FileAttributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                        != 0
                         || (info.FileAttributes & FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0
                         || (info.FileAttributes & FILE_ATTRIBUTE_OFFLINE) != 0;
 
@@ -185,7 +184,9 @@ fn read_dir_nt(dir: &Path, volume_serial: u32) -> Vec<NtEntry> {
         }
     }
 
-    unsafe { let _ = CloseHandle(dir_handle); };
+    unsafe {
+        let _ = CloseHandle(dir_handle);
+    };
     results
 }
 
@@ -218,11 +219,7 @@ fn get_volume_serial(path: &Path) -> u32 {
         )
     };
 
-    if result.is_ok() {
-        vol_serial
-    } else {
-        0
-    }
+    if result.is_ok() { vol_serial } else { 0 }
 }
 
 /// Walk `root` using NtQueryDirectoryFileEx, parallelized with a work queue
@@ -230,8 +227,10 @@ pub fn scan_nt(root: &Path) -> std::io::Result<ScanResult> {
     let root = root.canonicalize()?;
     let volume_serial = get_volume_serial(&root);
 
-    let mut dir_sizes_logical: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
-    let mut dir_sizes_allocated: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+    let mut dir_sizes_logical: std::collections::HashMap<PathBuf, u64> =
+        std::collections::HashMap::new();
+    let mut dir_sizes_allocated: std::collections::HashMap<PathBuf, u64> =
+        std::collections::HashMap::new();
     let mut files: Vec<FileRecord> = Vec::new(); // path, logical, allocated, mtime, file_id, vol_serial, is_reparse, is_cloud, reparse_tag
     let mut file_count = 0u64;
     let mut dir_count = 0u64;
@@ -269,8 +268,10 @@ pub fn scan_nt(root: &Path) -> std::io::Result<ScanResult> {
                     // Add to all ancestors (logical size)
                     let mut ancestor = entry.path.parent();
                     while let Some(dir) = ancestor {
-                        *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) += entry.logical_size;
-                        *dir_sizes_allocated.entry(dir.to_path_buf()).or_insert(0) += entry.allocated_size;
+                        *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) +=
+                            entry.logical_size;
+                        *dir_sizes_allocated.entry(dir.to_path_buf()).or_insert(0) +=
+                            entry.allocated_size;
                         if dir == root {
                             break;
                         }
@@ -343,11 +344,15 @@ pub fn spawn_scan_nt(
         let mut dirs_to_process: Vec<PathBuf> = vec![root.clone()];
 
         while let Some(dir) = dirs_to_process.pop() {
-            if !alive { break; }
+            if !alive {
+                break;
+            }
 
             let entries = read_dir_nt(&dir, volume_serial);
             for entry in entries {
-                if !alive { break; }
+                if !alive {
+                    break;
+                }
 
                 if entry.is_dir {
                     send_or_stop!(NtScanEvent::Dir(entry.path.clone()));
@@ -356,11 +361,21 @@ pub fn spawn_scan_nt(
                 }
 
                 let key = entry.path.clone();
-                let val = (entry.logical_size, entry.allocated_size, entry.mtime, entry.file_id, entry.volume_serial, entry.is_reparse, entry.is_cloud, entry.reparse_tag);
+                let val = (
+                    entry.logical_size,
+                    entry.allocated_size,
+                    entry.mtime,
+                    entry.file_id,
+                    entry.volume_serial,
+                    entry.is_reparse,
+                    entry.is_cloud,
+                    entry.reparse_tag,
+                );
 
                 match &baseline {
                     None => {
-                        full_batch.push((key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7));
+                        full_batch
+                            .push((key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7));
                         if full_batch.len() >= 500 {
                             send_or_stop!(NtScanEvent::Files(std::mem::take(&mut full_batch)));
                         }
@@ -370,13 +385,24 @@ pub fn spawn_scan_nt(
                         let unchanged = base
                             .get(&key)
                             .map(|(ls, als, m, fid, vs, irp, icl, rpt)| {
-                                *ls == val.0 && *als == val.1 && *m == val.2 && *fid == val.3 && *vs == val.4 && *irp == val.5 && *icl == val.6 && *rpt == val.7
+                                *ls == val.0
+                                    && *als == val.1
+                                    && *m == val.2
+                                    && *fid == val.3
+                                    && *vs == val.4
+                                    && *irp == val.5
+                                    && *icl == val.6
+                                    && *rpt == val.7
                             })
                             .unwrap_or(false);
                         if !unchanged {
-                            changed_batch.push((key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7));
+                            changed_batch.push((
+                                key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7,
+                            ));
                             if changed_batch.len() >= 500 {
-                                send_or_stop!(NtScanEvent::Changed(std::mem::take(&mut changed_batch)));
+                                send_or_stop!(NtScanEvent::Changed(std::mem::take(
+                                    &mut changed_batch
+                                )));
                             }
                         }
                         since_progress += 1;
@@ -389,7 +415,9 @@ pub fn spawn_scan_nt(
             }
         }
 
-        if !alive { return; }
+        if !alive {
+            return;
+        }
 
         match baseline {
             None => {

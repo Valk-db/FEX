@@ -218,7 +218,9 @@ fn get_recycle_bin_config(volume_guid: &str) -> Option<(bool, u64)> {
         )
     };
 
-    unsafe { let _ = RegCloseKey(hkey); };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    };
 
     if result != ERROR_SUCCESS {
         return Some((bin_enabled, 0)); // Unknown capacity

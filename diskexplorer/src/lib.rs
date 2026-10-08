@@ -249,7 +249,17 @@ pub fn scan(root: &Path) -> io::Result<ScanData> {
                 .map(|m| (m.len(), mtime_of(&m)))
                 .unwrap_or((0, 0));
             // jwalk doesn't provide file_id, volume_serial, etc.
-            files.push((path.clone(), size, size, mtime, [0u8; 16], 0, false, false, 0));
+            files.push((
+                path.clone(),
+                size,
+                size,
+                mtime,
+                [0u8; 16],
+                0,
+                false,
+                false,
+                0,
+            ));
             let mut ancestor = path.parent();
             while let Some(dir) = ancestor {
                 *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) += size;
@@ -344,7 +354,8 @@ pub fn spawn_scan(
                         .map(|(s, m)| *s == size && *m == mtime)
                         .unwrap_or(false);
                     if !unchanged {
-                        changed_batch.push((path, size, size, mtime, [0u8; 16], 0, false, false, 0));
+                        changed_batch
+                            .push((path, size, size, mtime, [0u8; 16], 0, false, false, 0));
                         if changed_batch.len() >= SCAN_BATCH {
                             send_or_stop!(ScanEvent::Changed(std::mem::take(&mut changed_batch)));
                         }
@@ -428,8 +439,7 @@ fn compute_growth(prev: &[FileRec], curr: &[(PathBuf, u64, i64)]) -> Vec<GrowthI
 impl App {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let root = root.canonicalize()?;
-        let db = SnapshotDb::open()
-            .map_err(|e| io::Error::other(format!("db: {e}")))?;
+        let db = SnapshotDb::open().map_err(|e| io::Error::other(format!("db: {e}")))?;
         let root_str = root.to_string_lossy().to_string();
         let db_err = |e: rusqlite::Error| io::Error::other(format!("db: {e}"));
 
@@ -535,7 +545,18 @@ impl App {
                     Ok(ScanEvent::Files(batch)) => {
                         let n = batch.len() as u64;
                         let mut batch_changed = false;
-                        for (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, _reparse_tag) in batch {
+                        for (
+                            path,
+                            logical_size,
+                            allocated_size,
+                            mtime,
+                            file_id,
+                            volume_serial,
+                            is_reparse,
+                            is_cloud,
+                            _reparse_tag,
+                        ) in batch
+                        {
                             // Handle reparse points (junctions, symlinks) - never follow, zero size
                             if is_reparse {
                                 self.unreadable_count += 1;
@@ -557,10 +578,22 @@ impl App {
                             }
 
                             // Handle hardlinks - dedupe by (volume_serial, file_id)
+                            // Zero IDs mean "identity unknown" (jwalk doesn't provide them) - never dedup
+                            let zero_id = file_id == [0u8; 16] || volume_serial == 0;
                             let hardlink_key = (volume_serial, file_id);
-                            let is_first_hardlink = self.hardlink_map.insert(hardlink_key, path.clone()).is_none();
+                            let is_first_hardlink = if zero_id {
+                                true // never dedup when identity is unknown
+                            } else {
+                                self.hardlink_map
+                                    .insert(hardlink_key, path.clone())
+                                    .is_none()
+                            };
 
-                            let size_to_add = if self.size_mode_logical { logical_size } else { allocated_size };
+                            let size_to_add = if self.size_mode_logical {
+                                logical_size
+                            } else {
+                                allocated_size
+                            };
 
                             if is_first_hardlink {
                                 // First time seeing this file - add its size
@@ -583,7 +616,18 @@ impl App {
                     Ok(ScanEvent::Changed(batch)) => {
                         let n = batch.len() as u64;
                         let mut batch_changed = false;
-                        for (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, _reparse_tag) in batch {
+                        for (
+                            path,
+                            logical_size,
+                            allocated_size,
+                            mtime,
+                            file_id,
+                            volume_serial,
+                            is_reparse,
+                            is_cloud,
+                            _reparse_tag,
+                        ) in batch
+                        {
                             // Handle reparse points
                             if is_reparse {
                                 if let Some(i) = self.file_index.get(&path).copied() {
@@ -612,10 +656,22 @@ impl App {
                             }
 
                             // Handle hardlinks
+                            // Zero IDs mean "identity unknown" (jwalk doesn't provide them) - never dedup
+                            let zero_id = file_id == [0u8; 16] || volume_serial == 0;
                             let hardlink_key = (volume_serial, file_id);
-                            let is_first_hardlink = self.hardlink_map.insert(hardlink_key, path.clone()).is_none();
+                            let is_first_hardlink = if zero_id {
+                                true // never dedup when identity is unknown
+                            } else {
+                                self.hardlink_map
+                                    .insert(hardlink_key, path.clone())
+                                    .is_none()
+                            };
 
-                            let size_to_add = if self.size_mode_logical { logical_size } else { allocated_size };
+                            let size_to_add = if self.size_mode_logical {
+                                logical_size
+                            } else {
+                                allocated_size
+                            };
 
                             let delta = match self.file_index.get(&path).copied() {
                                 Some(i) => {
@@ -1545,16 +1601,24 @@ impl App {
             parts.push(help);
         }
         if let Some((done, total)) = self.hash_progress()
-            && total > 0 {
-                parts.push(format!("hashing {done}/{total}"));
-            }
+            && total > 0
+        {
+            parts.push(format!("hashing {done}/{total}"));
+        }
         // Show unreadable count if any
         if self.unreadable_count > 0 {
-            parts.push(format!("{} unreadable (~{} not counted)",
-                self.unreadable_count, human_size(self.unreadable_bytes)));
+            parts.push(format!(
+                "{} unreadable (~{} not counted)",
+                self.unreadable_count,
+                human_size(self.unreadable_bytes)
+            ));
         }
         // Show size mode
-        let size_mode = if self.size_mode_logical { "logical" } else { "allocated" };
+        let size_mode = if self.size_mode_logical {
+            "logical"
+        } else {
+            "allocated"
+        };
         parts.push(format!("size: {size_mode} (S toggles)"));
         match self.view {
             View::Browse => {
@@ -1769,7 +1833,11 @@ mod tests {
         for ev in rx {
             match ev {
                 ScanEvent::Changed(batch) => {
-                    changed.extend(batch.into_iter().map(|(p, ls, _, _, _, _, _, _, _)| (p, ls)));
+                    changed.extend(
+                        batch
+                            .into_iter()
+                            .map(|(p, ls, _, _, _, _, _, _, _)| (p, ls)),
+                    );
                 }
                 ScanEvent::Deleted(list) => deleted.extend(list),
                 ScanEvent::Progress(n) => progress += n,
@@ -1789,7 +1857,11 @@ mod tests {
             "{changed_names:?}"
         );
         // Note: "same.bin" might appear as changed due to mtime precision differences
-        assert!(changed.len() >= 2 && changed.len() <= 3, "changed: {:?}", changed_names);
+        assert!(
+            changed.len() >= 2 && changed.len() <= 3,
+            "changed: {:?}",
+            changed_names
+        );
         assert_eq!(deleted.len(), 1);
         assert_eq!(
             deleted[0].0.file_name().unwrap().to_string_lossy(),
@@ -1842,7 +1914,10 @@ mod tests {
         Ok(ScanData {
             dir_sizes_logical,
             dir_sizes_allocated,
-            files: files.into_iter().map(|(p, s, m)| (p, s, s, m, [0u8; 16], 0, false, false, 0)).collect(),
+            files: files
+                .into_iter()
+                .map(|(p, s, m)| (p, s, s, m, [0u8; 16], 0, false, false, 0))
+                .collect(),
             file_count,
             dir_count,
             total_logical_bytes: total_logical,
@@ -1850,6 +1925,181 @@ mod tests {
             unreadable_count: 0,
             unreadable_bytes: 0,
         })
+    }
+
+    #[test]
+    fn hardlink_dedup_zero_ids_does_not_dedup() {
+        // Reproduce the bug: jwalk emits file_id=[0;16] and volume_serial=0 for all files.
+        // Before fix: all files treated as hardlink siblings, only first counted.
+        // After fix: zero IDs mean "identity unknown" - never dedup, always count.
+        // Test drives the real App::poll_scan path by manually feeding ScanEvent::Files.
+        // Use a fresh temp dir name to avoid DB pollution.
+        let d = tmpdir("hardlink_zero_ids_fresh");
+        write_file(&d, "a.bin", &[1u8; 100]);
+        write_file(&d, "b.bin", &[2u8; 200]);
+        write_file(&d, "c.bin", &[3u8; 300]);
+
+        // Use canonicalized root for both App and file paths
+        let root = d.canonicalize().unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+
+        // Clear any state loaded from DB (test dir is fresh, but DB might have old entries)
+        app.dir_sizes.clear();
+        app.file_list.clear();
+        app.file_index.clear();
+        app.hardlink_map.clear();
+        app.unreadable_count = 0;
+        app.unreadable_bytes = 0;
+        app.scanned_files = 0;
+        app.scanned_dirs = 0;
+        app.baseline_at = None;
+
+        // Stop the background scan that App::new started
+        app.scan_rx = None;
+        app.scanning = false;
+
+        // Manually feed Files event with zero IDs (simulating jwalk output)
+        // Use paths based on the canonicalized root so ancestor matching works
+        let files = vec![
+            (
+                root.join("a.bin"),
+                100u64,
+                100u64,
+                1i64,
+                [0u8; 16],
+                0u32,
+                false,
+                false,
+                0u32,
+            ),
+            (
+                root.join("b.bin"),
+                200u64,
+                200u64,
+                2i64,
+                [0u8; 16],
+                0u32,
+                false,
+                false,
+                0u32,
+            ),
+            (
+                root.join("c.bin"),
+                300u64,
+                300u64,
+                3i64,
+                [0u8; 16],
+                0u32,
+                false,
+                false,
+                0u32,
+            ),
+        ];
+        let rx = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(ScanEvent::Files(files)).unwrap();
+            rx
+        };
+        app.scan_rx = Some(rx);
+        app.scanning = true;
+
+        // Poll scan - should process all files
+        app.poll_scan();
+
+        // Total logical bytes should equal sum of all file sizes (600)
+        let total = app.dir_sizes.get(&app.root).copied().unwrap_or(0);
+        assert_eq!(
+            total, 600,
+            "Total size should equal sum of file sizes (100+200+300=600)"
+        );
+
+        // No hardlink siblings should be counted (all files have distinct paths)
+        // Note: unreadable_count includes reparse + cloud + hardlink_siblings
+        // Since we have no reparse/cloud, any unreadable_count > 0 indicates the bug
+        assert_eq!(
+            app.unreadable_count, 0,
+            "No files should be marked as unreadable/hardlink siblings with zero IDs"
+        );
+
+        // All 3 files should be in file_list with correct sizes
+        assert_eq!(app.file_list.len(), 3);
+        let mut sizes: Vec<u64> = app.file_list.iter().map(|(_, s, _)| *s).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn hardlink_dedup_nonzero_ids_dedupes_correctly() {
+        // Test that real hardlinks (non-zero file_id/volume_serial) are still deduped
+        // This test drives the Changed event path with non-zero IDs.
+        let d = tmpdir("hardlink_nonzero_fresh");
+        write_file(&d, "a.bin", &[1u8; 100]);
+        write_file(&d, "b.bin", &[1u8; 100]);
+
+        // Use canonicalized root
+        let root = d.canonicalize().unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+
+        // Clear any state loaded from DB
+        app.dir_sizes.clear();
+        app.file_list.clear();
+        app.file_index.clear();
+        app.hardlink_map.clear();
+        app.unreadable_count = 0;
+        app.unreadable_bytes = 0;
+        app.scanned_files = 0;
+        app.scanned_dirs = 0;
+        app.baseline_at = None;
+
+        // Stop the background scan
+        app.scan_rx = None;
+        app.scanning = false;
+
+        // Feed two files with SAME non-zero file_id and volume_serial (simulating hardlinks)
+        let files = vec![
+            (
+                root.join("a.bin"),
+                100u64,
+                100u64,
+                1i64,
+                [1u8; 16],
+                12345u32,
+                false,
+                false,
+                0u32,
+            ),
+            (
+                root.join("b.bin"),
+                100u64,
+                100u64,
+                1i64,
+                [1u8; 16],
+                12345u32,
+                false,
+                false,
+                0u32,
+            ),
+        ];
+        let rx = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(ScanEvent::Files(files)).unwrap();
+            rx
+        };
+        app.scan_rx = Some(rx);
+        app.scanning = true;
+
+        // Poll scan - first file should count, second should be deduped
+        app.poll_scan();
+
+        // Total should be 100 (only one copy counted)
+        let total = app.dir_sizes.get(&app.root).copied().unwrap_or(0);
+        assert_eq!(total, 100, "Hardlink siblings should be deduped");
+
+        // unreadable_count should include 1 for the hardlink sibling
+        assert_eq!(
+            app.unreadable_count, 1,
+            "Second file should be marked as hardlink sibling"
+        );
     }
 
     #[test]
