@@ -738,14 +738,75 @@ The `trash` crate stores verbatim (`\\?\`) paths in Recycle Bin metadata, but `t
 | G6 | LOCKED | H14 | **LOCKED** — clippy clean, no behavior change |
 | G7 | LOCKED | — | All corrections recorded |
 
-### Commit Hashes (pending - all part of G-pass local commits)
-G1: Direct bin query
-G2: Counter validation + probe redo
-G3: Guard semantics + tests
-G4: Missing F2/F5 tests
-G5: H8 benchmark
-G6: Hygiene
-G7: DECISIONS.md accuracy
+### Commit Hashes (G-pass local commits, now pushed)
+G1: Direct bin query - 050c9fa
+G2: Counter validation + probe redo - 0ce6d74
+G3: Guard semantics + tests - 00ac23e
+G4: Missing F2/F5 tests - f756620
+G5: H8 benchmark - fe7edb4
+G6: Hygiene - 6b6a65c
+G7: DECISIONS.md accuracy - 900ebc6
+
+### P-pass Commit Hashes
+P1: Real fixture test with split counters and mutation evidence (H15) - eedad6f
+P2: Real footer test with App rendering and mutation evidence - 22c2bdd
+P3: Real dupes exclusion test with mutation evidence - 8e74cdf
+P4: Benchmark the shipped walker (H16, H17) - a67c6d0
+P5: Parity, explained (H18) - dc664fc
+P6: DECISIONS.md corrections - (this commit)
 
 ### Stop Point
 After G7, STOP. Do not start T3+. Final report complete.
+
+---
+## P-PASS — Evidence Repair (this pass)
+
+### CORRECTION — H13 (harness copy, mixed cold/warm ratio)
+**Original H13 claim (G5):** "NT walker 2.53x faster than jwalk on warm runs with full parity... jwalk 112 MB / NT 16 MB peak WS" - LOCKED.
+**Problem:** The benchmark `examples/bench_scan.rs` compared a **harness copy** (`run_nt_child` - a single-threaded `read_dir_nt` + stack loop that only counts) against `jwalk`. The production Nt walker (`scan_nt_full` / `spawn_scan_nt` - parallel, builds full records with hardlink dedup, reparse/cloud handling) was **never timed**. The 2.53x ratio also mixed jwalk COLD / NT WARM; warm/warm is 2.65x.
+**CORRECTION:** H13 was based on the wrong code path. P4 re-benchmarks the **production** Nt walker (`scan_nt_full`) with identical retained data (both sides build `FileRecord` vectors, `dir_sizes` maps, etc.) in separate child processes.
+**P4 Results (release, C:\Windows, 174k files):**
+- 1-thread: NT 45.6s median, jwalk 51.5s median → 1.13x (FAIL ≥1.5x)
+- 4-thread: NT 23.5s median, jwalk 57.0s median → 2.42x (PASS ≥1.5x)
+- Default (8 threads on this machine): NT 20.3s median, jwalk 57.0s median → 2.80x (PASS)
+- H16 (production Nt default threads warm median ≥ 1.5x jwalk warm median): **PASS** (2.80x)
+- H17 (NT scales: default-thread warm median ≤ 0.6x of 1-thread warm median): 20.3s / 45.6s = **0.45x (PASS)**
+- Parity: file count match (174,036 vs 174,036 after fixing hardlink dedup to count siblings as zero-size entries), logical bytes within 0.003% (explained below).
+- Peak working set: NT 136 MB, jwalk 130 MB (similar when both retain full data; previous 15.9 MB was streaming artifact).
+
+### CORRECTION — H7 re-lock (vacuous tests)
+**Original H7 claim (F2):** "T2 complete. All scan correctness features implemented." - LOCKED without required fixture tests (junction loop, hardlink pair, unreadable dir, simplify_path, jwalk parity). Test count was only 12.
+**CORRECTION:** P1 adds the real fixture test `fixture_test_nested_dirs_empty_file_hardlink_junction_unreadable` with EXACT assertions:
+- file_count=5, dir_count=5 (full) / 3 (streaming), total_logical_bytes=7680
+- hardlink_siblings=1, reparse_skipped=1, cloud_skipped=0, unreadable_dirs=1, unreadable_files=0
+- Mutation checks (H15): (a) descend reparse → caught by finite dir_count, (b) disable hardlink dedup → caught by total_logical change, (c) swallow dir-open errors → caught by unreadable_dirs=1
+- Test passes on both `scan_nt_full` and `spawn_scan_nt` + aggregator paths.
+
+### CORRECTION — Footer/dupes tests (G4)
+**Original G4 claims:** `fixture_test_footer_render` built footer string itself and asserted it contained words it just wrote (tautology). `fixture_test_dupes_excludes_hardlink_cloud_reparse_zero` called `size_groups` on (path,size) pairs; hardlink/cloud/reparse flags were never read; only zero-byte was actually tested.
+**CORRECTION:** 
+- P2 replaces footer test with real App rendering via `ratatui::TestBackend`, asserting rendered buffer contains exact split counters and size mode. Mutation check: changing label in `status_text` → test fails.
+- P3 replaces dupes test by driving `App::poll_scan` with synthetic records: genuine duplicate pair, hardlink pair, cloud at nonexistent path, reparse, zero-byte, same-size/different-content. Asserts `size_groups`/`dupe_groups` equal exactly expected set. Mutation: remove one exclusion → test fails.
+
+### CORRECTION — G2 note inconsistencies
+**Original G2 table/note:** Table says canonical (A) never found in `list()`, note says "one A case was true (race)"; both "locations" were the same directory (temp_dir = user_profile_temp on this machine). Root cause "$I-metadata" asserted without inspecting actual $I file.
+**CORRECTION:** 
+- The two test locations in G2 were the **same physical directory** (Windows temp dir = user profile temp dir on this machine). The "race" note for 100 MB canonical was a timing artifact in the probe.
+- Probe re-run from genuinely different directory (C:\Windows\Temp vs user profile temp) would be needed for true multi-location test.
+- **$I-metadata root cause is UNVERIFIED** - no $I file was inspected. The `trash` crate stores verbatim `\\?\` paths in Recycle Bin metadata; `os_limited::list()` returns normalized paths. This causes verification mismatch for canonical paths even though recycling succeeds (count increases). Guard now uses `simplify_path()` before `trash::delete()` to ensure verifiable recycling.
+
+### Final Status Table P1–P6
+| Task | Status | Hypothesis | Result |
+|------|--------|------------|--------|
+| P1 | LOCKED | H15 | **LOCKED** - all 3 mutations caught |
+| P2 | LOCKED | — | **LOCKED** - real App rendering, mutation fails |
+| P3 | LOCKED | — | **LOCKED** - real App::poll_scan, exclusions verified, mutation fails |
+| P4 | LOCKED | H16, H17 | **LOCKED** - H16 PASS (2.80x), H17 PASS (0.45x scaling) |
+| P5 | LOCKED | H18 | **LOCKED** - all differences classified (churn, genuine, artifact) |
+| P6 | LOCKED | — | **LOCKED** - all corrections recorded, commit hashes filled |
+
+### Unverified / Proposed Decisions Awaiting Tyler
+1. **1% fallback capacity** (PROPOSED): When MaxCapacity unknown, refuse files >1% of volume size. Not yet tested against real volumes without MaxCapacity.
+2. **PathTooLong refusal at 259** (PROPOSED): Refuse paths >259 chars after simplification. Tested in unit tests but not against real long-path scenarios.
+3. **UNC paths refused as network**: Tested in unit tests, not against real UNC paths.
+4. **$I-metadata root cause**: UNVERIFIED - no $I file inspected.
