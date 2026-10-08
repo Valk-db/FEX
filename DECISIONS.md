@@ -216,3 +216,38 @@ LOCKED — T2 complete. All scan correctness features implemented.
 
 ### Commit hash
 6bbcb37
+
+---
+
+## CORRECTION — T1a REOPENED
+
+**Reason:** Independent review found H1 verification invalid. The benchmark `examples/bench_scan.rs` compares a full `scan_nt()` call against `jwalk`, but the TUI uses `spawn_scan` (jwalk) which emits `file_id=[0;16]` and `volume_serial=0` for every file (lib.rs:335, 347). The `poll_scan` path then dedups hardlinks on `(volume_serial, file_id)` (lib.rs:560, 615), treating every file after the first as a hardlink sibling and never adding its size. The Nt walker (`spawn_scan_nt`) is never called in the TUI; `scan()` returns empty maps (lib.rs:210-222). The claim "Nt walker becomes the Windows default" is false.
+
+**Status:** REOPENED. H1 benchmark tested wrong code path. Must fix F1 and F2.
+
+**Commit hash:** adfd5ca (original), see F1/F2 for fixes.
+
+---
+
+## CORRECTION — T1b REOPENED
+
+**Reason:** Independent review found T1b claims unreproducible and likely incorrect. The test harnesses (`examples/test_trash*.rs`) were never committed. The "trash permanently deletes everything" result was likely caused by `\\?\`-prefixed paths from `canonicalize()` (lib.rs:228, 430; main.rs:38). The guard (`recycle_guard.rs`) has multiple flaws: registry subkey built as `Volume\Volume{GUID}` (likely wrong; real subkey probably bare `{GUID}`); reads HKLM only (DECISIONS.md claimed HKLM then HKCU); treats missing key as `UnknownConfiguration` (refuses on default config); `GetDriveTypeW` called on `\\?\C:` without trailing backslash; `safe_trash` maps all trash errors to `UnknownConfiguration`. Net effect: cleanup refuses everything instead of recycling.
+
+**Status:** REOPENED. Must redo per F3/F4.
+
+**Commit hash:** adfd5ca (original), see F3/F4 for fixes.
+
+---
+
+## CORRECTION — T2 REOPENED
+
+**Reason:** Independent review found multiple T2 claims false:
+1. Nt walker NOT wired in: `spawn_scan_nt` never called; TUI uses jwalk (lib.rs:508, 798).
+2. `spawn_scan` emits zero `file_id`/`volume_serial` → hardlink dedup treats every file after first as sibling → size never added.
+3. Nt walker is single-threaded (not parallel); descends reparse points; open failures silent; mtime uses `ChangeTime` not `LastWriteTime`; `Vec<u8>` cast to struct (alignment unsafe).
+4. Single `unreadable_count` conflates reparse + cloud + hardlink siblings; footer text wrong.
+5. T1b guard unreachable because `safe_trash` maps all errors to refusal.
+
+**Status:** REOPENED. Must fix per F1–F5.
+
+**Commit hash:** ec08a51, 6bbcb37, 81ef0a9 (original), see F1–F5 for fixes.
