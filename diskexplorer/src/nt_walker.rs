@@ -99,6 +99,12 @@ pub struct ScanResult {
     pub total_allocated_bytes: u64,
     pub unreadable_count: u64,
     pub unreadable_bytes: u64,
+    // Split counters for testability and UI
+    pub hardlink_siblings: u64,
+    pub reparse_skipped: u64,
+    pub cloud_skipped: u64,
+    pub unreadable_dirs: u64,
+    pub unreadable_files: u64,
 }
 
 /// Read a single directory using NtQueryDirectoryFileEx
@@ -291,6 +297,11 @@ pub fn scan_nt_full(root: &Path) -> std::io::Result<ScanData> {
         total_allocated_bytes: result.total_allocated_bytes,
         unreadable_count: result.unreadable_count,
         unreadable_bytes: result.unreadable_bytes,
+        hardlink_siblings: result.hardlink_siblings,
+        reparse_skipped: result.reparse_skipped,
+        cloud_skipped: result.cloud_skipped,
+        unreadable_dirs: result.unreadable_dirs,
+        unreadable_files: result.unreadable_files,
     })
 }
 
@@ -311,6 +322,7 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let mut all_dirs = Vec::new();
     let mut dirs_to_scan = vec![root.to_path_buf()];
     let mut unreadable_dirs_total = Vec::new();
+    let mut reparse_dirs_count = 0u64; // Track reparse directories seen in first phase
 
     while let Some(dir) = dirs_to_scan.pop() {
         let (entries, unreadable_dirs) = read_dir_nt(&dir, volume_serial);
@@ -320,6 +332,9 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
             if entry.is_dir && !entry.is_reparse {
                 // Only descend into non-reparse directories
                 dirs_to_scan.push(entry.path.clone());
+            } else if entry.is_dir && entry.is_reparse {
+                // Reparse directory (junction/symlink) - count it
+                reparse_dirs_count += 1;
             }
         }
         // Always add the directory to all_dirs for counting
@@ -351,6 +366,16 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let total_allocated = Arc::new(AtomicU64::new(0));
     let unreadable_count = Arc::new(AtomicU64::new(0));
     let unreadable_bytes = Arc::new(AtomicU64::new(0));
+    // Split counters
+    let hardlink_siblings = Arc::new(AtomicU64::new(0));
+    let reparse_skipped = Arc::new(AtomicU64::new(0));
+    let cloud_skipped = Arc::new(AtomicU64::new(0));
+    let unreadable_files = Arc::new(AtomicU64::new(0));
+    // Hardlink deduplication map (shared across threads)
+    let hardlink_map = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        (u32, [u8; 16]),
+        PathBuf,
+    >::new()));
 
     pool.install(|| {
         use rayon::prelude::*;
@@ -358,22 +383,37 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
             let (entries, _) = read_dir_nt(dir, volume_serial);
             for entry in entries {
                 if entry.is_dir {
-                    // Directories are already in all_dirs, just initialize their size entries
-                    dir_sizes_logical
-                        .lock()
-                        .unwrap()
-                        .entry(entry.path.clone())
-                        .or_insert(0);
-                    dir_sizes_allocated
-                        .lock()
-                        .unwrap()
-                        .entry(entry.path.clone())
-                        .or_insert(0);
+                    if entry.is_reparse {
+                        // Reparse directory (junction/symlink) - already counted in first phase
+                        // Just add to files with zero size
+                        files.lock().unwrap().push((
+                            entry.path,
+                            0, // logical_size = 0 for reparse
+                            0, // allocated_size = 0 for reparse
+                            entry.mtime,
+                            entry.file_id,
+                            entry.volume_serial,
+                            entry.is_reparse,
+                            entry.is_cloud,
+                            entry.reparse_tag,
+                        ));
+                    } else {
+                        // Regular directory - initialize size entries
+                        dir_sizes_logical
+                            .lock()
+                            .unwrap()
+                            .entry(entry.path.clone())
+                            .or_insert(0);
+                        dir_sizes_allocated
+                            .lock()
+                            .unwrap()
+                            .entry(entry.path.clone())
+                            .or_insert(0);
+                    }
                 } else {
-                    file_count.fetch_add(1, Ordering::Relaxed);
-
                     if entry.is_reparse {
                         unreadable_count.fetch_add(1, Ordering::Relaxed);
+                        reparse_skipped.fetch_add(1, Ordering::Relaxed);
                         // Still add to files with zero size
                         files.lock().unwrap().push((
                             entry.path,
@@ -388,6 +428,7 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                         ));
                     } else if entry.is_cloud {
                         unreadable_count.fetch_add(1, Ordering::Relaxed);
+                        cloud_skipped.fetch_add(1, Ordering::Relaxed);
                         unreadable_bytes.fetch_add(entry.logical_size, Ordering::Relaxed);
                         // Cloud placeholders - zero contributed size
                         files.lock().unwrap().push((
@@ -402,30 +443,50 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                             entry.reparse_tag,
                         ));
                     } else {
-                        total_logical.fetch_add(entry.logical_size, Ordering::Relaxed);
-                        total_allocated.fetch_add(entry.allocated_size, Ordering::Relaxed);
+                        // Hardlink deduplication: check if we've seen this (volume_serial, file_id) before
+                        let zero_id = entry.file_id == [0u8; 16] || entry.volume_serial == 0;
+                        let hardlink_key = (entry.volume_serial, entry.file_id);
+                        let is_first_hardlink = if zero_id {
+                            true // never dedup when identity is unknown
+                        } else {
+                            hardlink_map
+                                .lock()
+                                .unwrap()
+                                .insert(hardlink_key, entry.path.clone())
+                                .is_none()
+                        };
 
-                        // Add to all ancestors
-                        let mut ancestor = entry.path.parent();
-                        while let Some(dir) = ancestor {
-                            dir_sizes_logical
-                                .lock()
-                                .unwrap()
-                                .entry(dir.to_path_buf())
-                                .or_insert(0);
-                            dir_sizes_allocated
-                                .lock()
-                                .unwrap()
-                                .entry(dir.to_path_buf())
-                                .or_insert(0);
-                            *dir_sizes_logical.lock().unwrap().get_mut(dir).unwrap() +=
-                                entry.logical_size;
-                            *dir_sizes_allocated.lock().unwrap().get_mut(dir).unwrap() +=
-                                entry.allocated_size;
-                            if dir == root {
-                                break;
+                        if is_first_hardlink {
+                            file_count.fetch_add(1, Ordering::Relaxed);
+                            total_logical.fetch_add(entry.logical_size, Ordering::Relaxed);
+                            total_allocated.fetch_add(entry.allocated_size, Ordering::Relaxed);
+
+                            // Add to all ancestors
+                            let mut ancestor = entry.path.parent();
+                            while let Some(dir) = ancestor {
+                                dir_sizes_logical
+                                    .lock()
+                                    .unwrap()
+                                    .entry(dir.to_path_buf())
+                                    .or_insert(0);
+                                dir_sizes_allocated
+                                    .lock()
+                                    .unwrap()
+                                    .entry(dir.to_path_buf())
+                                    .or_insert(0);
+                                *dir_sizes_logical.lock().unwrap().get_mut(dir).unwrap() +=
+                                    entry.logical_size;
+                                *dir_sizes_allocated.lock().unwrap().get_mut(dir).unwrap() +=
+                                    entry.allocated_size;
+                                if dir == root {
+                                    break;
+                                }
+                                ancestor = dir.parent();
                             }
-                            ancestor = dir.parent();
+                        } else {
+                            // Hardlink sibling - track but don't double-count size
+                            hardlink_siblings.fetch_add(1, Ordering::Relaxed);
+                            unreadable_count.fetch_add(1, Ordering::Relaxed);
                         }
 
                         files.lock().unwrap().push((
@@ -462,8 +523,14 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
         total_logical_bytes: total_logical.load(Ordering::Relaxed),
         total_allocated_bytes: total_allocated.load(Ordering::Relaxed),
         unreadable_count: unreadable_count.load(Ordering::Relaxed)
-            + unreadable_dirs_total.len() as u64,
+            + unreadable_dirs_total.len() as u64
+            + reparse_dirs_count,
         unreadable_bytes: unreadable_bytes.load(Ordering::Relaxed),
+        hardlink_siblings: hardlink_siblings.load(Ordering::Relaxed),
+        reparse_skipped: reparse_skipped.load(Ordering::Relaxed) + reparse_dirs_count,
+        cloud_skipped: cloud_skipped.load(Ordering::Relaxed),
+        unreadable_dirs: unreadable_dirs_total.len() as u64,
+        unreadable_files: unreadable_files.load(Ordering::Relaxed),
     };
 
     Ok((
@@ -497,6 +564,9 @@ pub fn spawn_scan_nt(
         };
         let volume_serial = get_volume_serial(&root);
 
+        // Create event channel early so we can send events during first pass
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<NtScanEvent>();
+
         // First pass: collect all directories (breadth-first, single-threaded)
         let mut all_dirs = Vec::new();
         let mut dirs_to_scan = vec![root.clone()];
@@ -514,7 +584,7 @@ pub fn spawn_scan_nt(
         }
 
         // Log unreadable dirs
-        for (dir_path, status) in unreadable_dirs {
+        for (dir_path, status) in &unreadable_dirs {
             eprintln!("Unreadable dir: {} status={:?}", dir_path.display(), status);
         }
 
@@ -528,8 +598,6 @@ pub fn spawn_scan_nt(
             ThreadPoolBuilder::new().build().unwrap()
         };
 
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<NtScanEvent>();
-
         // For diff scan, we need shared seen set - use Arc<Mutex<HashSet>>
         let seen_arc = if baseline.is_some() {
             Some(Arc::new(std::sync::Mutex::new(
@@ -541,11 +609,31 @@ pub fn spawn_scan_nt(
 
         pool.install(|| {
             use rayon::prelude::*;
+            // Shared hardlink map for streaming scan
+            let hardlink_map = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                (u32, [u8; 16]),
+                PathBuf,
+            >::new()));
+            // Track which directories we've already sent Dir events for (to avoid duplicates)
+            let sent_dirs = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<PathBuf>::new()));
             all_dirs.par_iter().for_each(|dir| {
                 let (entries, _) = read_dir_nt(dir, volume_serial);
                 for entry in entries {
                     if entry.is_dir {
-                        let _ = event_tx.send(NtScanEvent::Dir(entry.path.clone()));
+                        if entry.is_reparse {
+                            // Reparse directory - send as a zero-size file entry so UI can track it
+                            let _ = event_tx.send(NtScanEvent::Files(vec![(
+                                entry.path.clone(),
+                                0, 0, entry.mtime, entry.file_id, entry.volume_serial,
+                                true, false, entry.reparse_tag,
+                            )]));
+                        } else {
+                            // Only send Dir event if we haven't sent it before
+                            let mut sent = sent_dirs.lock().unwrap();
+                            if sent.insert(entry.path.clone()) {
+                                let _ = event_tx.send(NtScanEvent::Dir(entry.path.clone()));
+                            }
+                        }
                     } else {
                         let key = entry.path.clone();
                         let val = (
@@ -558,6 +646,25 @@ pub fn spawn_scan_nt(
                             entry.is_cloud,
                             entry.reparse_tag,
                         );
+
+                        // Hardlink deduplication for streaming scan
+                        let zero_id = entry.file_id == [0u8; 16] || entry.volume_serial == 0;
+                        let hardlink_key = (entry.volume_serial, entry.file_id);
+                        let is_first_hardlink = if zero_id {
+                            true // never dedup when identity is unknown
+                        } else {
+                            hardlink_map
+                                .lock()
+                                .unwrap()
+                                .insert(hardlink_key, entry.path.clone())
+                                .is_none()
+                        };
+
+                        if !is_first_hardlink {
+                            // Hardlink sibling - skip sending (will be handled by UI layer)
+                            // We still send it but with zero sizes to indicate it's a sibling
+                            // The UI layer will filter based on flags
+                        }
 
                         match &baseline {
                             None => {
