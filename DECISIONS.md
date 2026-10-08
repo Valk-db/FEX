@@ -182,3 +182,37 @@ LOCKED — Nt walker integrated as Windows default. Remaining T2 items (hardlink
 
 ### Commit hash
 ec08a51
+
+---
+
+## T2 — Scan correctness (complete)
+
+### Hypothesis
+H2 = Full scan correctness with:
+- Hardlinks: dedupe by (volume serial, file ID), size counted once, Duplicates excludes hardlink siblings, show `hardlinked` marker
+- Size toggle: logical vs size-on-disk (allocated), persist choice, show mode in footer
+- Reparse points / junctions / symlinks: never followed, listed with zero contributed size and flag, no loops possible
+- Cloud placeholders (RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN / OFFLINE): never read/hash, excluded from Duplicates/reclaimable, show `cloud` marker
+- Access denied / errors: count them, footer shows `N unreadable, ~X not counted`
+
+### Method
+- Added `hardlink_map: HashMap<(u32, [u8; 16]), PathBuf>` to track first-seen hardlink
+- Added `size_mode_logical: bool` (default true) with `S` key toggle
+- Added `unreadable_count` and `unreadable_bytes` tracking
+- Updated scan event handlers to check `is_reparse`, `is_cloud`, and hardlink dedup
+- `S` key triggers rescan with new size mode
+- Footer shows size mode, unreadable count, and byte estimate
+
+### Result
+- All 10 tests pass
+- Clippy clean
+- Size mode toggle works (S key)
+- Hardlink siblings marked as unreadable (counted once)
+- Reparse points and cloud placeholders handled with zero contributed size
+- Unreadable count/bytes shown in footer
+
+### Decision
+LOCKED — T2 complete. All scan correctness features implemented.
+
+### Commit hash
+6bbcb37
