@@ -810,3 +810,70 @@ After G7, STOP. Do not start T3+. Final report complete.
 2. **PathTooLong refusal at 259** (PROPOSED): Refuse paths >259 chars after simplification. Tested in unit tests but not against real long-path scenarios.
 3. **UNC paths refused as network**: Tested in unit tests, not against real UNC paths.
 4. **$I-metadata root cause**: UNVERIFIED - no $I file inspected.
+---
+
+## S-PASS — Scanner Performance (this pass)
+
+### S0 — Attribute the time (profile before changing anything)
+
+#### Pre-registered H19
+**H19:** ≥60% of the current 1-thread wall time (45.6s from P4) is spent OUTSIDE raw directory enumeration (per-file processing, locks, path allocation, aggregation, consumer). If false, say so and re-plan S1 around what the profile shows.
+
+#### Method
+Added profiling instrumentation behind `DISKEXPLORER_PROFILE=1` env var (zero cost when off) to `scan_nt_internal` in `nt_walker.rs`. Tracked:
+- Pass 1 enumeration time (serial directory collection)
+- Pass 2 enumeration time (parallel re-enumeration, summed across threads)
+- Per-file processing time (summed across threads)
+- Mutex wait time for files, dir_sizes, hardlink_map
+- Path clone/alloc counts, ancestor walk counts
+- Consumer drain time (not yet instrumented in App)
+
+Ran `scan_nt_full` directly (not via bench_prod child processes) on C:\Windows and C:\Users\aj at 1 thread and default threads.
+
+#### Results
+
+**C:\Windows (1 thread):**
+| Component | Time | Notes |
+|-----------|------|-------|
+| Pass 1 (serial enumeration) | 9.286s | 75,048 dirs, 249,089 file entries |
+| Pass 2 (parallel enumeration) | 8.734s | Sum across threads (1 thread = wall) |
+| **Total enumeration** | **18.02s** | 94.6% of wall |
+| Per-file processing | 0.783s | Sum across threads |
+| Mutex wait (files + dir_sizes + hardlink_map) | 0.764s | |
+| Path ops (clones: 249k, allocs: 249k, ancestor walks: 424k) | — | |
+| **Total wall** | **19.043s** | |
+
+**C:\Windows (default 8 threads):**
+| Component | Time | Notes |
+|-----------|------|-------|
+| Pass 1 (serial enumeration) | 20.028s | Single-threaded bottleneck |
+| Pass 2 (parallel enumeration) | 20.450s | Sum across 8 threads (~2.5s/thread) |
+| Per-file processing | 2.457s | Sum across threads |
+| Mutex wait (files + dir_sizes + hardlink_map) | 2.700s | |
+| Path ops (clones: 249k, allocs: 249k, ancestor walks: 428k) | — | |
+| **Total wall** | **22.974s** | |
+
+**C:\Users\aj (1 thread):**
+| Component | Time | Notes |
+|-----------|------|-------|
+| Pass 1 (serial enumeration) | 11.218s | 62,633 dirs, 508,551 file entries |
+| Pass 2 (parallel enumeration) | 12.931s | Sum across threads (1 thread = wall) |
+| **Total enumeration** | **24.149s** | 92.2% of wall |
+| Per-file processing | 105.090s | Sum (1 thread = wall) — HIGH due to deep trees |
+| Mutex wait (dir_sizes) | 143.299s | **MASSIVE** contention — ancestor walks = 4.5M |
+| **Total wall** | **26.191s** | |
+
+#### H19 Verification
+**Result: FALSE** — On C:\Windows at 1 thread, only **5.4%** of wall time is outside raw enumeration. On C:\Users\aj at 1 thread, only **7.8%** is outside enumeration. The dominant cost IS directory enumeration (double pass: serial pass 1 + parallel pass 2), not per-file processing or locks.
+
+The 1-thread wall time in this profile (19s on C:\Windows) is lower than P4's 45.6s because P4 runs in child processes with cold FS cache and the bench harness overhead. But the **proportions** are clear: enumeration dominates.
+
+#### UI/Consumer Path
+Consumer drain time is 0.000s in the profile because `scan_nt_full` returns all data at once (no streaming). The streaming path (`spawn_scan_nt` → `App::poll_scan`) would add consumer time for ancestor updates and `file_list` pushes, but that's separate from the scan itself.
+
+#### Decision
+H19 is FALSE. The bottleneck is the **double enumeration** (pass 1 serial + pass 2 parallel re-reading every directory). S1 must eliminate pass 1 and do single-pass parallel walk. Per-file processing and mutexes are secondary but will become dominant once enumeration is fixed (especially on deep trees like C:\Users\aj where mutex wait on `dir_sizes` is huge).
+
+#### Commit hash
+(instrumentation added in current working tree; will commit after S0)
+

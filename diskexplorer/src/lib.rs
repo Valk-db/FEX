@@ -8,6 +8,7 @@
 pub mod db;
 pub mod dupes;
 pub mod nt_walker;
+pub mod profile;
 pub mod recycle_guard;
 
 use crate::db::{FileRec, ScanMeta, SnapshotDb};
@@ -2334,7 +2335,7 @@ mod tests {
         let expected_file_count = 5; // file1, file2, nested, empty, hardlink_src (hardlink_dst is sibling)
         let expected_dir_count_full = 5; // root, nested, nested/deep, nested/deep/deeper, unreadable_dir
         let expected_dir_count_streaming = 3; // nested, nested/deep, nested/deep/deeper (root & unreadable_dir not in dir_count)
-        let expected_logical_bytes = 1024 + 2048 + 4096 + 0 + 512; // = 7680
+        let expected_logical_bytes = 7680u64;
         let expected_hardlink_siblings = 1; // hardlink_dst
         let expected_reparse_skipped = 1; // junction_loop
         let expected_cloud_skipped = 0;
@@ -2496,7 +2497,7 @@ mod tests {
         let mut files_no_dedup: Vec<FileRecord> = Vec::new();
         let mut total_logical_no_dedup = 0u64;
         for file_record in &scan_data_nt.files {
-            let (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag) = file_record;
+            let (_, logical_size, _, _, _, _, is_reparse, is_cloud, _) = file_record;
             if !is_reparse && !is_cloud {
                 total_logical_no_dedup += logical_size;
             }

@@ -3,12 +3,11 @@
 //! Run with: cargo run --example parity_diff -- <path>
 //! Dumps sorted (path, logical size) lists from both walkers and diffs them.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use jwalk::WalkDir;
 use diskexplorer::nt_walker::scan_nt_full;
-use diskexplorer::FileRecord;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -35,12 +34,11 @@ fn main() {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if entry.file_type().is_file() {
-            if let Ok(meta) = entry.metadata() {
+        if entry.file_type().is_file()
+            && let Ok(meta) = entry.metadata() {
                 let size = meta.len();
                 jwalk_files.push((entry.path(), size));
             }
-        }
     }
     let jwalk_count = jwalk_files.len();
     let jwalk_logical: u64 = jwalk_files.iter().map(|(_, s)| *s).sum();
@@ -116,12 +114,11 @@ fn main() {
     let nt_map: std::collections::HashMap<_, _> = nt_list.iter().map(|(p, s)| (p, *s)).collect();
     let mut mismatches = 0;
     for (p, s) in &jwalk_files {
-        if let Some(nt_s) = nt_map.get(p) {
-            if *nt_s != *s {
+        if let Some(nt_s) = nt_map.get(p)
+            && *nt_s != *s {
                 println!("  MISMATCH: {} NT={} jwalk={}", p.display(), nt_s, s);
                 mismatches += 1;
             }
-        }
     }
     if mismatches == 0 {
         println!("  (none)");
@@ -148,11 +145,10 @@ fn main() {
         let mut jwalk_files2: Vec<(PathBuf, u64)> = Vec::new();
         for entry in WalkDir::new(&root).skip_hidden(false) {
             let entry = match entry { Ok(e) => e, Err(_) => continue };
-            if entry.file_type().is_file() {
-                if let Ok(meta) = entry.metadata() {
+            if entry.file_type().is_file()
+                && let Ok(meta) = entry.metadata() {
                     jwalk_files2.push((entry.path(), meta.len()));
                 }
-            }
         }
         jwalk_files2.sort_by(|a, b| a.0.cmp(&b.0));
 

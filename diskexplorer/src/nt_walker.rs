@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{BaselineEntry, FileRecord, ScanData};
+use crate::profile::ScanProfile;
 use rayon::ThreadPoolBuilder;
 use windows::Wdk::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFORMATION, FILE_INFORMATION_CLASS, FileIdExtdDirectoryInformation,
@@ -321,6 +322,9 @@ type InternalScanResult = (
 
 /// Internal implementation shared by scan_nt and scan_nt_full
 fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
+    let profile = if ScanProfile::enabled() { Some(ScanProfile::new()) } else { None };
+    let total_start = profile.as_ref().map(|_| std::time::Instant::now());
+
     let root = root.canonicalize()?;
     let volume_serial = get_volume_serial(&root);
 
@@ -330,9 +334,17 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let mut unreadable_dirs_total = Vec::new();
     let mut reparse_dirs_count = 0u64; // Track reparse directories seen in first phase
 
+    // Pass 1 timing
+    let pass1_start = profile.as_ref().map(|_| std::time::Instant::now());
+
     while let Some(dir) = dirs_to_scan.pop() {
         let (entries, unreadable_dirs) = read_dir_nt(&dir, volume_serial);
         unreadable_dirs_total.extend(unreadable_dirs);
+
+        if let Some(p) = &profile {
+            p.pass1_dir_count.fetch_add(1, Ordering::Relaxed);
+            p.pass1_file_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        }
 
         for entry in entries {
             if entry.is_dir && !entry.is_reparse {
@@ -345,6 +357,10 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
         }
         // Always add the directory to all_dirs for counting
         all_dirs.push(dir);
+    }
+
+    if let (Some(p), Some(start)) = (&profile, pass1_start) {
+        p.pass1_enumeration_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     // Now process all directories in parallel
@@ -386,9 +402,29 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
 
     pool.install(|| {
         use rayon::prelude::*;
+
         all_dirs.par_iter().for_each(|dir| {
+            let read_start = profile.as_ref().map(|_| std::time::Instant::now());
             let (entries, _) = read_dir_nt(dir, volume_serial);
+            if let (Some(p), Some(start)) = (&profile, read_start) {
+                p.pass2_enumeration_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+
+            if let Some(p) = &profile {
+                p.pass2_dir_count.fetch_add(1, Ordering::Relaxed);
+                p.pass2_file_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
+            }
+
+            // Track path clones and PathBuf allocations
+            if profile.is_some() {
+                // Each entry.path.clone() in the loop below will be counted
+            }
+
             for entry in entries {
+                if let Some(p) = &profile {
+                    p.path_clone_count.fetch_add(1, Ordering::Relaxed);
+                    p.pathbuf_alloc_count.fetch_add(1, Ordering::Relaxed);
+                }
                 if entry.is_dir {
                     if entry.is_reparse {
                         // Reparse directory (junction/symlink) - already counted in first phase
@@ -451,8 +487,11 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                         ));
                     } else {
                         // Hardlink deduplication: check if we've seen this (volume_serial, file_id) before
+                        let per_file_start = profile.as_ref().map(|_| std::time::Instant::now());
                         let zero_id = entry.file_id == [0u8; 16] || entry.volume_serial == 0;
                         let hardlink_key = (entry.volume_serial, entry.file_id);
+
+                        let hm_start = profile.as_ref().map(|_| std::time::Instant::now());
                         let is_first_hardlink = if zero_id {
                             true // never dedup when identity is unknown
                         } else {
@@ -462,6 +501,9 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                                 .insert(hardlink_key, entry.path.clone())
                                 .is_none()
                         };
+                        if let (Some(p), Some(start)) = (&profile, hm_start) {
+                            p.mutex_wait_hardlink_map_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
 
                         if is_first_hardlink {
                             file_count.fetch_add(1, Ordering::Relaxed);
@@ -471,20 +513,34 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                             // Add to all ancestors
                             let mut ancestor = entry.path.parent();
                             while let Some(dir) = ancestor {
+                                if let Some(p) = &profile {
+                                    p.ancestor_walk_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let ds_start = profile.as_ref().map(|_| std::time::Instant::now());
                                 dir_sizes_logical
                                     .lock()
                                     .unwrap()
                                     .entry(dir.to_path_buf())
                                     .or_insert(0);
+                                if let (Some(p), Some(start)) = (&profile, ds_start) {
+                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                }
                                 dir_sizes_allocated
                                     .lock()
                                     .unwrap()
                                     .entry(dir.to_path_buf())
                                     .or_insert(0);
+                                if let (Some(p), Some(start)) = (&profile, ds_start) {
+                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                }
+                                let ds_start2 = profile.as_ref().map(|_| std::time::Instant::now());
                                 *dir_sizes_logical.lock().unwrap().get_mut(dir).unwrap() +=
                                     entry.logical_size;
                                 *dir_sizes_allocated.lock().unwrap().get_mut(dir).unwrap() +=
                                     entry.allocated_size;
+                                if let (Some(p), Some(start)) = (&profile, ds_start2) {
+                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                }
                                 if dir == root {
                                     break;
                                 }
@@ -496,6 +552,7 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                             unreadable_count.fetch_add(1, Ordering::Relaxed);
                         }
 
+                        let files_start = profile.as_ref().map(|_| std::time::Instant::now());
                         files.lock().unwrap().push((
                             entry.path,
                             entry.logical_size,
@@ -507,6 +564,14 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                             entry.is_cloud,
                             entry.reparse_tag,
                         ));
+                        if let (Some(p), Some(start)) = (&profile, files_start) {
+                            p.mutex_wait_files_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+
+                        if let (Some(p), Some(start)) = (&profile, per_file_start) {
+                            p.per_file_processing_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            p.file_processed_count.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -539,6 +604,14 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
         unreadable_dirs: unreadable_dirs_total.len() as u64,
         unreadable_files: unreadable_files.load(Ordering::Relaxed),
     };
+
+    // Print profile if enabled
+    if let Some(p) = &profile {
+        if let Some(start) = total_start {
+            p.total_wall_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        p.print_summary();
+    }
 
     Ok((
         result,

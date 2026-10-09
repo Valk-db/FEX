@@ -15,7 +15,7 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use diskexplorer::nt_walker::scan_nt_full;
-use diskexplorer::{FileRecord, ScanData};
+use diskexplorer::FileRecord;
 
 // Results from a single scan
 #[derive(Debug, Clone)]
@@ -178,8 +178,8 @@ fn run_jwalk_prod_child(root: &Path) -> ScanResult {
     let mut dir_count = 0u64;
     let mut total_logical = 0u64;
     let mut total_allocated = 0u64;
-    let mut unreadable_count = 0u64;
-    let mut unreadable_bytes = 0u64;
+    let _unreadable_count = 0u64;
+    let _unreadable_bytes = 0u64;
 
     // To match NT walker's retained data structure, we need:
     // - file_id, volume_serial (set to 0 for jwalk)
@@ -344,7 +344,7 @@ fn main() {
     }
 
     // Parent process
-    let path = if args.len() > 1 {
+    let _path = if args.len() > 1 {
         PathBuf::from(&args[1])
     } else {
         std::env::current_dir().unwrap()
