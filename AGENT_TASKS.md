@@ -1,68 +1,79 @@
-# AGENT_TASKS.md — diskexplorer P-PASS (evidence repair). Supersedes the G-pass list. T3–T9 (AGENT_TASKS_v1.md) stay paused until this completes and Tyler approves.
+# AGENT_TASKS.md — diskexplorer S-PASS (scanner performance). Supersedes the P-pass list. T3–T9 (AGENT_TASKS_v1.md) stay paused until Tyler approves after this pass.
 
 ## Why this exists
-Review of master @ 900ebc6. Guard path (G1–G3) is good. These G-pass claims are NOT supported by the code:
-1. Benchmark (H13) did not time the shipped walker. `examples/bench_scan.rs` `run_nt_child` is a separate single-threaded copy (`read_dir_nt` + `dirs_to_process` stack) that only counts; production `nt_walker::scan_nt_full` / `spawn_scan` (parallel, builds records) was never timed. The "2.53x" and "7x lower memory" describe the harness copy. 2.53x also mixes jwalk COLD / Nt WARM (warm/warm = 2.65x); DECISIONS.md uses both. 174k files in ~8.6s (~20k files/s; cold ≈ warm) suggests syscall/CPU-bound directory opens; thread scaling was never checked.
-2. Parity: logical bytes differ by exactly 8,192 and dir counts by 1 (75,048 vs 75,047); labeled "reparse noise" with no evidence.
-3. H7 re-lock is vacuous: `fixture_test_nested_dirs_empty_file_hardlink_junction_unreadable` asserts only `is_ok`, `file_count > 0`, `total_logical_bytes > 0`. The expected 8,292 is a comment. `_junction_created` result is discarded (passes if mklink fails). Hardlink dedup, junction-not-followed, `unreadable_dirs` unasserted.
-4. `fixture_test_footer_render` builds the footer string itself and asserts it contains words it just wrote (never renders the app).
-5. `fixture_test_dupes_excludes_hardlink_cloud_reparse_zero` calls `dupes::size_groups` on (path,size) pairs; the hardlink/cloud/reparse flags in its tuples are never read. Only zero-byte is actually tested.
-6. G2 write-up: table says canonical (A) never found in `list()`, note says one A case was true ("race"); the two "locations" are the same dir; the `$I`-metadata root cause was asserted without inspecting it.
+P-pass accepted (master @ c380a04). Benchmark of the SHIPPED walker (bench_prod, C:\Windows, 174k files, warm medians): Nt 1 thread 45.6s, 4 threads 23.5s, 8 threads 20.3s; the old count-only harness did the same tree single-threaded in 8.6s. Scaling 1→8 threads is only 2.25x. Code at c380a04 (`nt_walker.rs` `spawn_scan_nt` ~L496–530, `scan_nt_internal` ~L323–440):
+- Pass 1 is single-threaded: `read_dir_nt` (enumerates files too) on every directory just to collect subdirs. Pass 2 re-enumerates every directory in parallel → each directory is read twice, first read serial.
+- Per-file global `Mutex`es (files Vec, two dir-size HashMaps), per-file `PathBuf` clones, per-file ancestor walk with PathBuf-keyed HashMap lookups.
+- `FileRecord` is a 9-tuple type alias.
+- Reparse FILES (sockets, app-exec aliases) are not emitted at all (53 on the user profile); F2 spec said emit with flag and 0 contributed bytes.
+- Unexplained: parity gap of 9.8 MB between two timed runs (the P5 diff tool found only a 4 KB churn mismatch).
+Goal: make the scanner fast on non-admin NTFS without changing observable behavior.
 
 ## Standing rules (never violate)
 1. Brainstorm before building. Verify before building.
 2. Commits stay LOCAL until Tyler pushes. No push, no remote ops.
-3. Trash is NEVER permanent delete. Cannot recycle → REFUSE and report.
+3. Trash is NEVER permanent delete. (Not touched in this pass; do not modify recycle_guard.rs.)
 4. Test only on throwaway files you create. Never touch real user files.
 5. Every `unsafe` block has a `// SAFETY:` comment.
 
 ## Working protocol (every task)
 1. Read code first; findings into DECISIONS.md.
-2. Pre-register hypothesis + threshold BEFORE measuring. IDs unique; this pass uses H15–H18.
+2. Pre-register hypothesis + numeric threshold BEFORE measuring. IDs unique; this pass uses H19–H24.
 3. `cargo fmt`; `cargo clippy --all-targets -- -D warnings`; `cargo test`. No exemptions.
-4. LOCKED only with reproducible evidence: exact command, test names, measured numbers. A test only counts as evidence if it can fail: show it failing (mutation check, below) before claiming it passes.
-5. Benchmarks measure the SHIPPED code path with the SAME retained data on both sides. Never compare cold to warm. Report cold/cold and warm/warm separately.
-6. Never measure by shelling out; direct Win32/NT calls only.
-7. One local commit per task: `P<n>: <summary>`. Fill real commit hashes in DECISIONS.md (replace every "pending").
+4. LOCKED only with reproducible evidence: exact command, test names, measured numbers. A test only counts if it can fail: run a mutation and record the ACTUAL failure output.
+5. Benchmarks: shipped code path, same retained data both sides, separate process per run, cold/cold and warm/warm reported separately, never mixed. A/B against the baseline commit in the SAME session (machine state drifts): `git worktree add ../FEX_baseline c380a04`, build `bench_prod` there, alternate A/B runs.
+6. Direct Win32/NT calls only; no shelling out for measurement.
+7. One local commit per task: `S<n>: <summary>`. Real commit hashes in DECISIONS.md.
 8. Failed verification → STOP, record, do not continue.
 9. Never edit past DECISIONS.md entries; append `## CORRECTION`.
+10. Observable behavior is frozen unless a task says otherwise: ScanEvent stream semantics (Dir/Files/Changed/Deleted/Progress), live repaint cadence (150ms), counters, ScanData fields, db snapshot contents, diff-scan results.
 
 ---
 
-## P1 — Real fixture test (replaces the vacuous one)
-- Expose the split counters on `ScanData` (`hardlink_siblings`, `reparse_skipped`, `cloud_skipped`, `unreadable_dirs`, `unreadable_files`) if not already; the test must read them from the real data, not infer.
-- Fixture built by code with a known expected result: nested dirs (3 levels); empty file; files of distinct known sizes; hardlink pair (`fs::hard_link`); directory junction pointing at its own parent; one deny-ACL dir.
-- The test must FAIL (not skip, not pass vacuously) if: mklink fails (assert exit status AND that the junction exists and `fs::read_dir` through it works), or icacls deny didn't take effect (assert `fs::read_dir(unreadable)` returns Err before scanning). ACL restore in a drop guard; delete the junction with `rmdir` (never recurse through it).
-- Assert EXACT: file_count, dir_count, logical bytes (hardlink counted once), allocated-bytes relationship (≥ logical for non-empty files), `hardlink_siblings == 1`, `reparse_skipped == 1`, `unreadable_dirs == 1`, `cloud_skipped == 0`, `unreadable_files == 0`, and that NO scanned path lies under the junction.
-- Run the same assertions through BOTH paths: `scan_nt_full` and the real streaming path (`spawn_scan` → `App::poll_scan`).
-- Mutation evidence (H15): temporarily (a) make the walker descend reparse dirs, (b) disable hardlink dedup, (c) swallow dir-open errors silently. Show each makes the test FAIL; record the failure messages in DECISIONS.md; revert each mutation. Hypothesis H15: all three mutations are caught.
+## S0 — Attribute the time (profile before changing anything)
+- Instrument the CURRENT production path with `QueryPerformanceCounter` totals (cfg(feature = "profile") or an env var; zero cost when off): pass-1 enumeration, pass-2 enumeration, per-file processing, mutex wait time, path clone/alloc count, channel send/batch, and — end to end — the consumer side: time inside `App::poll_scan` draining a full-tree scan headlessly (ancestor updates to `dir_sizes`, `file_list` pushes, hardlink map).
+- Run on C:\Windows at 1 thread and default threads; record a table of seconds per component.
+- Pre-register H19: ≥60% of the current 1-thread wall time (45.6s) is spent OUTSIDE raw directory enumeration (per-file processing, locks, path allocation, aggregation, consumer). If false, say so and re-plan S1 around what the profile shows.
+- Record also: is the UI/consumer path a bottleneck? (consumer seconds vs producer seconds, overlapped or serialized).
+- Commit instrumentation behind the flag only if it costs nothing when off; otherwise keep it out of main.
 
-## P2 — Real footer test
-- Feed scan events into a real `App`, render the UI into a ratatui `TestBackend` buffer, and assert the buffer text contains each split counter with the exact fixture numbers and the size-mode text. No hand-built strings. Delete `fixture_test_footer_render`'s tautology.
-- Mutation: change one counter label/value in the footer code → test fails; record, revert.
+## S1 — Single-pass parallel walker
+- Each directory is enumerated EXACTLY ONCE (assert with a debug counter in tests). Work-stealing: either `rayon::scope` recursive spawn per subdirectory or crossbeam-deque `Injector` + workers with an atomic pending-count termination. Pick one, justify with measurements; if H21 fails, try the other.
+- No per-file locks. Workers accumulate into thread-local/per-task buffers (records batch, per-directory own-size sums) and send batches over the existing channel; batch size a named constant (start 4096 records) so the 150ms repaint stays smooth on small and huge trees.
+- Directory sizes: per-directory own-file totals computed by the worker once per directory; propagation to ancestors happens once per DIRECTORY (not per file). Keep dir-size maps correct for live partial views (partial totals must never exceed final totals; monotonic).
+- Keep `scan_nt_full` and `spawn_scan` signatures and ScanData/ScanEvent shapes. Keep diff/baseline scans on the same walker. THREAD_COUNT / `DISKEXPLORER_NT_THREADS` behavior preserved.
+- Replace the 9-tuple `FileRecord` alias with a named struct (same fields, same order of meaning); update all uses; no behavior change.
+- Hypothesis H20 (correctness): P1 fixture test (exact counters, both paths) passes unchanged; plus the new stress test below passes.
+- Stress test (new): generate a temp tree with ≥2,000 dirs (random depth ≤ 8, 0–12 files each, a few empty dirs, deterministic seed printed on failure); compare file set, dir set, per-dir recursive sizes against a simple reference recursive `std::fs` walk. Run at 1, 2, 8 threads, 20 iterations each. No lost dirs, no duplicates, sizes equal.
+- Mutation checks, record real failure output: (a) skip enumeration of one subdir under a race (e.g., drop a queued dir when pending count hits a threshold), (b) enumerate a dir twice, (c) descend reparse dirs. Each must fail a test.
 
-## P3 — Real dupes exclusion test
-- Drive `App::poll_scan` with synthetic records: (1) a genuine duplicate pair (same content, different file IDs, real files); (2) a hardlink pair (same non-zero volume_serial+file_id); (3) a cloud-flagged record at a NONEXISTENT path; (4) a reparse-flagged record; (5) a zero-byte file; (6) a same-size/different-content file.
-- Assert `size_groups`/`dupe_groups` equal exactly the expected set (only the genuine pair + the same-size candidate in the size group; hardlink sibling, cloud, reparse, zero-byte absent), and that no hash attempt is made for the cloud record (nonexistent path would error — assert no error and no hash entry).
-- If exclusions are not implemented where the test says they must be, fix the code (filter in the App's file list / grouping using the record flags), then re-run. Mutation check: remove one exclusion → test fails; record, revert.
+## S2 — Aggregation / path cost (CONDITIONAL on S0 and S1 results)
+- Do this only if, after S1, the profile still shows path hashing/cloning or consumer-side ancestor walks as the largest remaining component. Otherwise record "not needed" with the profile.
+- If needed: a dir arena for scan-time aggregation (`DirId(u32)`, `parent: Vec<u32>`, interned name storage) so ancestor propagation uses parent indices (no PathBuf hashing); convert to the app's existing `HashMap<PathBuf,u64>` only where the UI actually needs paths, lazily or once per batch. Do not rewrite views in this pass. Hypothesis H21b is whatever the profile predicts; pre-register it with a number before building.
 
-## P4 — Benchmark the shipped walker (REQUIRED)
-- New example `bench_prod` (keep the old harness but label it "harness copy" in DECISIONS.md). Each measured run is a separate child process, one walker per process, one run per process; parent collects results.
-- Side A: production Nt walker (`scan_nt_full` or the exact function `spawn_scan` uses), default threads. Side B: jwalk-based scan that builds the SAME record structure into the SAME retained collections (extract the non-Windows `scan()` jwalk logic as a bench-only function). Both retain what the app retains.
-- Record per run: wall ms, files, dirs, logical bytes, peak working set (`PeakWorkingSetSize`), thread count.
-- Trees: `C:\Windows` and the user profile dir (`%USERPROFILE%`), whichever exist; report file counts.
-- Thread scaling for side A via an env var (e.g. `DISKEXPLORER_NT_THREADS`): 1, 4, and default (logical cores), 3 runs each (first = cold, rest warm).
-- Pre-register H16: production Nt, default threads, warm median ≥ 1.5x faster than jwalk-equivalent (warm/warm), with the SAME retained data. H17: Nt walker scales: default-thread warm median ≤ 0.6x of the 1-thread warm median. If H17 fails: profile per-directory open time vs enumeration vs record-processing (instrument with `QueryPerformanceCounter` totals) and report where time goes. Do not change the walker in this pass unless the profile shows an obvious bug; report instead.
-- Decision rule: H16 pass → LOCKED. 1.0–1.5x → keep Nt, record honestly. <1.0x or parity fails → STOP and report.
+## S3 — Emit reparse files (decision from F2 spec, now implemented)
+- Reparse FILES (non-directory reparse points: sockets, AppExecLink aliases, file symlinks) are emitted as entries with `is_reparse=true`, 0 contributed bytes, counted in `reparse_skipped`, never hashed or grouped by Duplicates, never double-counted. Reparse DIRECTORIES stay listed-but-not-descended.
+- Update the fixture/dupes tests accordingly (extend, don't weaken). Integration evidence: on `%USERPROFILE%`, the jwalk-only entry count in the parity diff drops from 53 to 0 (or each remaining one is named and explained).
 
-## P5 — Parity, explained
-- Outside timing, dump sorted (path, logical size) lists from both sides for each tree and diff them. Name EVERY differing path with its size/mtime. Classify each as (a) changed during run (re-run twice; if the same path differs every time it is not churn), (b) genuine handling difference, or (c) harness artifact.
-- Pre-register H18: after classification, every difference is explained, and there are zero unexplained differences. The 8,192-byte delta and the 75,048 vs 75,047 directory count must be explained by name (likely the root dir counting — confirm).
+## S4 — Benchmark the shipped code, A/B (REQUIRED)
+- Extend `bench_prod`: (a) scan-only (`scan_nt_full`), (b) END-TO-END headless: `spawn_scan` + the real `App::poll_scan` drain loop until finished (this is what the user waits for).
+- A/B: baseline worktree at c380a04 vs new, alternating, same session, C:\Windows and %USERPROFILE%; threads 1, 4, default; 3 runs each (first = cold, rest warm). Also run the old count-only harness once in the same session as the physical floor.
+- Pre-registered targets (record honestly if missed; do not move the goalposts after measuring):
+  - H21: new, 1 thread, warm median, scan-only ≤ 2.0x the same-session count-only harness time.
+  - H22: new, default threads, warm median, END-TO-END ≤ 0.5x of baseline end-to-end at default threads (baseline c380a04 scan-only was 20.3s).
+  - H23: scaling: new default-thread warm median ≤ 0.35x of new 1-thread warm median.
+  - H24: peak working set not worse than baseline by more than 10% (baseline 136 MB on C:\Windows).
+- Decision rule: all pass → LOCKED. Any miss → record numbers, profile the miss (S0 instrumentation) and report; do not start unrelated work.
 
-## P6 — DECISIONS.md corrections
-- CORRECTION entries: H13 (harness copy, mixed cold/warm ratio), H7 re-lock (vacuous tests), the footer/dupes tests, G2 note inconsistencies (reconcile the table vs the "race" note; state that both locations were the same directory and run the probe once more from a genuinely different directory, e.g. a folder on the user profile, if one differs).
-- Do NOT assert the `$I`-metadata root cause unless you inspect an actual `$I` file and record the evidence; otherwise mark it UNVERIFIED.
-- Replace all "(pending)" commit hashes with real ones.
+## S5 — Parity, again
+- Dump sorted (path, logical size, is_reparse) lists from baseline and new for both trees outside timing; diff; name every differing path and classify (churn: rerun twice, same path differing every time is not churn; handling difference; artifact). Expected differences: only S3's newly emitted reparse files.
+- Explain the earlier unexplained 9.8 MB gap: run baseline-vs-baseline back-to-back twice and report the run-to-run delta on C:\Windows so churn is bounded with data.
+- Pre-register H25: after classification, zero unexplained differences.
+
+## S6 — Evidence cleanup
+- Re-run each P1/P2/P3 mutation once and paste the ACTUAL failure output (not a one-line summary) into DECISIONS.md.
+- Remove the two tautological asserts left in the footer test (`"Mutation: ... CAUGHT"` lines).
+- CORRECTION entries as needed; real commit hashes for S0–S6.
 
 ## Stop point
-After P6, STOP. Do not start T3+. Final report: P1–P6 status, H15–H18 results with numbers (warm/warm and cold/cold separately), mutation-check evidence, parity classification table, anything UNVERIFIED, and PROPOSED decisions awaiting Tyler (1%-of-volume bound, PathTooLong refusal, UNC refusal).
+After S6, STOP. Do not start T3+. Final report: S0 time-attribution table, S1 design chosen and why, H19–H25 results with numbers (cold/cold and warm/warm separately, scan-only and end-to-end, A/B same session), mutation failure output, parity classification, anything UNVERIFIED, and open PROPOSED decisions for Tyler (1%-of-volume bound, PathTooLong refusal, UNC refusal).

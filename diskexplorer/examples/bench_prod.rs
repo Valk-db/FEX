@@ -9,13 +9,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use jwalk::WalkDir;
-use windows::Win32::System::ProcessStatus::{
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
-};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::Threading::GetCurrentProcess;
 
-use diskexplorer::nt_walker::scan_nt_full;
 use diskexplorer::FileRecord;
+use diskexplorer::nt_walker::scan_nt_full;
 
 // Results from a single scan
 #[derive(Debug, Clone)]
@@ -113,7 +111,10 @@ fn scan_nt_prod(root: &Path) -> ScanResult {
         .expect("Failed to run NT walker child process");
 
     if !output.status.success() {
-        eprintln!("NT walker child failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "NT walker child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::process::exit(1);
     }
 
@@ -131,7 +132,10 @@ fn scan_jwalk_prod(root: &Path) -> ScanResult {
         .expect("Failed to run jwalk child process");
 
     if !output.status.success() {
-        eprintln!("jwalk child failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "jwalk child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::process::exit(1);
     }
 
@@ -202,7 +206,8 @@ fn run_jwalk_prod_child(root: &Path) -> ScanResult {
             let (size, mtime) = entry
                 .metadata()
                 .map(|m| {
-                    let mtime = m.modified()
+                    let mtime = m
+                        .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64)
@@ -212,17 +217,17 @@ fn run_jwalk_prod_child(root: &Path) -> ScanResult {
                 .unwrap_or((0, 0));
 
             // Same record structure as NT walker
-            files.push((
-                path.clone(),
-                size,          // logical_size
-                size,          // allocated_size (jwalk doesn't distinguish)
+            files.push(FileRecord {
+                path: path.clone(),
+                logical_size: size,
+                allocated_size: size,
                 mtime,
-                [0u8; 16],     // file_id
-                0,             // volume_serial
-                false,         // is_reparse
-                false,         // is_cloud
-                0,             // reparse_tag
-            ));
+                file_id: [0u8; 16],
+                volume_serial: 0,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            });
 
             total_logical += size;
             total_allocated += size;
@@ -284,7 +289,11 @@ fn run_benchmark(root: &Path, runs: u32, thread_counts: &[usize]) -> Vec<ScanRes
         // Set thread count for NT walker
         set_thread_count(threads);
 
-        let thread_label = if threads == 0 { "default (rayon)".to_string() } else { threads.to_string() };
+        let thread_label = if threads == 0 {
+            "default (rayon)".to_string()
+        } else {
+            threads.to_string()
+        };
         println!("--- Thread count: {} ---", thread_label);
 
         for run in 1..=runs {
@@ -351,10 +360,7 @@ fn main() {
     };
 
     // Test on C:\Windows and %USERPROFILE%
-    let test_dirs: Vec<PathBuf> = vec![
-        PathBuf::from(r"C:\Windows"),
-        dirs::home_dir().unwrap(),
-    ];
+    let test_dirs: Vec<PathBuf> = vec![PathBuf::from(r"C:\Windows"), dirs::home_dir().unwrap()];
 
     let runs = 3;
     // Thread counts: 1, 4, and default (rayon)
@@ -368,8 +374,18 @@ fn main() {
             println!("\n=== SUMMARY FOR {} ===", dir.display());
             for walker in ["jwalk", "nt"] {
                 for &threads in &thread_counts {
-                    let walker_results: Vec<&ScanResult> =
-                        results.iter().filter(|r| r.walker == walker && r.thread_count == (if threads == 0 { num_cpus::get() } else { threads })).collect();
+                    let walker_results: Vec<&ScanResult> = results
+                        .iter()
+                        .filter(|r| {
+                            r.walker == walker
+                                && r.thread_count
+                                    == (if threads == 0 {
+                                        num_cpus::get()
+                                    } else {
+                                        threads
+                                    })
+                        })
+                        .collect();
                     if walker_results.is_empty() {
                         continue;
                     }
@@ -384,7 +400,11 @@ fn main() {
                         sorted[sorted.len() / 2]
                     };
 
-                    let thread_label = if threads == 0 { "default".to_string() } else { threads.to_string() };
+                    let thread_label = if threads == 0 {
+                        "default".to_string()
+                    } else {
+                        threads.to_string()
+                    };
                     println!("{} ({})", walker.to_uppercase(), thread_label);
                     println!("  Cold (run 1):    {}ms", cold.wall_ms);
                     println!("  Warm median:     {}ms", median_warm);
@@ -398,21 +418,38 @@ fn main() {
             }
 
             // H16: production Nt, default threads, warm median >= 1.5x faster than jwalk-equivalent (warm/warm)
-            let nt_default_results: Vec<&ScanResult> = results.iter().filter(|r| r.walker == "nt" && r.thread_count == num_cpus::get()).collect();
-            let jwalk_results: Vec<&ScanResult> = results.iter().filter(|r| r.walker == "jwalk").collect();
+            let nt_default_results: Vec<&ScanResult> = results
+                .iter()
+                .filter(|r| r.walker == "nt" && r.thread_count == num_cpus::get())
+                .collect();
+            let jwalk_results: Vec<&ScanResult> =
+                results.iter().filter(|r| r.walker == "jwalk").collect();
 
             if !nt_default_results.is_empty() && !jwalk_results.is_empty() {
                 let nt_cold = nt_default_results[0];
                 let jwalk_cold = jwalk_results[0];
 
-                let nt_warm: Vec<u64> = nt_default_results.iter().skip(1).map(|r| r.wall_ms).collect();
-                let jwalk_warm: Vec<u64> = jwalk_results.iter().skip(1).map(|r| r.wall_ms).collect();
+                let nt_warm: Vec<u64> = nt_default_results
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.wall_ms)
+                    .collect();
+                let jwalk_warm: Vec<u64> =
+                    jwalk_results.iter().skip(1).map(|r| r.wall_ms).collect();
 
-                let nt_median = if nt_warm.is_empty() { nt_cold.wall_ms } else {
-                    let mut s = nt_warm.clone(); s.sort(); s[s.len()/2]
+                let nt_median = if nt_warm.is_empty() {
+                    nt_cold.wall_ms
+                } else {
+                    let mut s = nt_warm.clone();
+                    s.sort();
+                    s[s.len() / 2]
                 };
-                let jwalk_median = if jwalk_warm.is_empty() { jwalk_cold.wall_ms } else {
-                    let mut s = jwalk_warm.clone(); s.sort(); s[s.len()/2]
+                let jwalk_median = if jwalk_warm.is_empty() {
+                    jwalk_cold.wall_ms
+                } else {
+                    let mut s = jwalk_warm.clone();
+                    s.sort();
+                    s[s.len() / 2]
                 };
 
                 let speedup = jwalk_median as f64 / nt_median as f64;
@@ -421,7 +458,10 @@ fn main() {
                 println!("    NT warm median:    {}ms", nt_median);
                 println!("    jwalk warm median: {}ms", jwalk_median);
                 println!("    Speedup:           {:.2}x", speedup);
-                println!("    PASS (>=1.5x):     {}", if speedup >= 1.5 { "YES" } else { "NO" });
+                println!(
+                    "    PASS (>=1.5x):     {}",
+                    if speedup >= 1.5 { "YES" } else { "NO" }
+                );
 
                 // Parity check
                 let files_match = nt_cold.file_count == jwalk_cold.file_count;
@@ -429,23 +469,47 @@ fn main() {
                 println!("    File count match:  {}", files_match);
                 println!("    Logical bytes match: {}", logical_match);
                 if !logical_match {
-                    let diff = (nt_cold.total_logical_bytes as i128 - jwalk_cold.total_logical_bytes as i128).abs();
+                    let diff = (nt_cold.total_logical_bytes as i128
+                        - jwalk_cold.total_logical_bytes as i128)
+                        .abs();
                     println!("    Diff: {} bytes", diff);
                 }
 
                 // H17: Nt walker scales: default-thread warm median <= 0.6x of 1-thread warm median
-                let nt_1thread_results: Vec<&ScanResult> = results.iter().filter(|r| r.walker == "nt" && r.thread_count == 1).collect();
-                let nt_default_results: Vec<&ScanResult> = results.iter().filter(|r| r.walker == "nt" && r.thread_count == num_cpus::get()).collect();
+                let nt_1thread_results: Vec<&ScanResult> = results
+                    .iter()
+                    .filter(|r| r.walker == "nt" && r.thread_count == 1)
+                    .collect();
+                let nt_default_results: Vec<&ScanResult> = results
+                    .iter()
+                    .filter(|r| r.walker == "nt" && r.thread_count == num_cpus::get())
+                    .collect();
 
                 if !nt_1thread_results.is_empty() && !nt_default_results.is_empty() {
-                    let nt_1thread_warm: Vec<u64> = nt_1thread_results.iter().skip(1).map(|r| r.wall_ms).collect();
-                    let nt_default_warm: Vec<u64> = nt_default_results.iter().skip(1).map(|r| r.wall_ms).collect();
+                    let nt_1thread_warm: Vec<u64> = nt_1thread_results
+                        .iter()
+                        .skip(1)
+                        .map(|r| r.wall_ms)
+                        .collect();
+                    let nt_default_warm: Vec<u64> = nt_default_results
+                        .iter()
+                        .skip(1)
+                        .map(|r| r.wall_ms)
+                        .collect();
 
-                    let nt_1thread_median = if nt_1thread_warm.is_empty() { nt_1thread_results[0].wall_ms } else {
-                        let mut s = nt_1thread_warm.clone(); s.sort(); s[s.len()/2]
+                    let nt_1thread_median = if nt_1thread_warm.is_empty() {
+                        nt_1thread_results[0].wall_ms
+                    } else {
+                        let mut s = nt_1thread_warm.clone();
+                        s.sort();
+                        s[s.len() / 2]
                     };
-                    let nt_default_median = if nt_default_warm.is_empty() { nt_default_results[0].wall_ms } else {
-                        let mut s = nt_default_warm.clone(); s.sort(); s[s.len()/2]
+                    let nt_default_median = if nt_default_warm.is_empty() {
+                        nt_default_results[0].wall_ms
+                    } else {
+                        let mut s = nt_default_warm.clone();
+                        s.sort();
+                        s[s.len() / 2]
                     };
 
                     let scale_ratio = nt_default_median as f64 / nt_1thread_median as f64;
@@ -454,10 +518,15 @@ fn main() {
                     println!("    NT 1-thread warm median:    {}ms", nt_1thread_median);
                     println!("    NT default warm median:     {}ms", nt_default_median);
                     println!("    Ratio (default/1-thread):   {:.2}x", scale_ratio);
-                    println!("    PASS (<=0.6x):              {}", if scale_ratio <= 0.6 { "YES" } else { "NO" });
+                    println!(
+                        "    PASS (<=0.6x):              {}",
+                        if scale_ratio <= 0.6 { "YES" } else { "NO" }
+                    );
 
                     if scale_ratio > 0.6 {
-                        println!("    WARNING: Poor scaling. Profile per-directory open time vs enumeration vs record-processing.");
+                        println!(
+                            "    WARNING: Poor scaling. Profile per-directory open time vs enumeration vs record-processing."
+                        );
                     }
                 }
             }

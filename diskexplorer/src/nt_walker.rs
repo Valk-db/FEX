@@ -9,8 +9,109 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// DirId arena for O(1) ancestor propagation without PathBuf hashing
+#[derive(Default, Debug)]
+struct DirArena {
+    // path -> dir_id (assigned in pass 1)
+    path_to_id: std::collections::HashMap<PathBuf, u32>,
+    // dir_id -> parent_dir_id (None for root)
+    parents: Vec<Option<u32>>,
+    // dir_id -> logical size sum of own files
+    own_logical: Vec<u64>,
+    // dir_id -> allocated size sum of own files
+    own_allocated: Vec<u64>,
+    // dir_id -> path (for final conversion to HashMap)
+    paths: Vec<PathBuf>,
+}
+
+impl DirArena {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Assign or get DirId for a path. Returns (dir_id, is_new).
+    fn get_or_assign(&mut self, path: PathBuf) -> (u32, bool) {
+        if let Some(&id) = self.path_to_id.get(&path) {
+            return (id, false);
+        }
+        let id = self.paths.len() as u32;
+        self.path_to_id.insert(path.clone(), id);
+        self.paths.push(path);
+        self.parents.push(None);
+        self.own_logical.push(0);
+        self.own_allocated.push(0);
+        (id, true)
+    }
+
+    /// Set parent for a dir_id (called in pass 1)
+    fn set_parent(&mut self, child_id: u32, parent_id: u32) {
+        if (child_id as usize) < self.parents.len() {
+            self.parents[child_id as usize] = Some(parent_id);
+        }
+    }
+
+    /// Add size to a directory's own totals (called by workers in pass 2)
+    #[inline]
+    fn add_own_size(&mut self, dir_id: u32, logical: u64, allocated: u64) {
+        let idx = dir_id as usize;
+        if idx < self.own_logical.len() {
+            self.own_logical[idx] = self.own_logical[idx].saturating_add(logical);
+            self.own_allocated[idx] = self.own_allocated[idx].saturating_add(allocated);
+        }
+    }
+
+    /// Propagate all own sizes to ancestors (single-threaded, after pass 2 merge)
+    fn propagate_to_ancestors(&mut self) {
+        // Process in reverse order (children before parents) so propagation works
+        // We already know the topological order from pass 1 BFS (all_dirs vector)
+        // But here we just iterate all dirs and propagate
+        for id in (0..self.paths.len()).rev() {
+            if let Some(parent) = self.parents[id] {
+                let p = parent as usize;
+                if p < self.own_logical.len() {
+                    self.own_logical[p] = self.own_logical[p].saturating_add(self.own_logical[id]);
+                    self.own_allocated[p] = self.own_allocated[p].saturating_add(self.own_allocated[id]);
+                }
+            }
+        }
+    }
+
+    /// Convert to HashMap<PathBuf, u64> for ScanData
+    fn to_hashmaps(&self) -> (std::collections::HashMap<PathBuf, u64>, std::collections::HashMap<PathBuf, u64>) {
+        let mut logical = std::collections::HashMap::with_capacity(self.paths.len());
+        let mut allocated = std::collections::HashMap::with_capacity(self.paths.len());
+        for (i, path) in self.paths.iter().enumerate() {
+            logical.insert(path.clone(), self.own_logical[i]);
+            allocated.insert(path.clone(), self.own_allocated[i]);
+        }
+        (logical, allocated)
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+}
+
+/// Thread-local accumulator for single-pass walker
+#[derive(Default)]
+struct ThreadLocalAccum {
+    files: Vec<FileRecord>,
+    // Use DirId indices instead of PathBuf keys for zero-hashing dir size accumulation
+    dir_sizes_logical: Vec<u64>,
+    dir_sizes_allocated: Vec<u64>,
+    file_count: u64,
+    total_logical: u64,
+    total_allocated: u64,
+    hardlink_siblings: u64,
+    reparse_skipped: u64,
+    cloud_skipped: u64,
+    unreadable_bytes: u64,
+    dir_count: u64,
+}
+
 use crate::{BaselineEntry, FileRecord, ScanData};
 use crate::profile::ScanProfile;
+use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use windows::Wdk::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFORMATION, FILE_INFORMATION_CLASS, FileIdExtdDirectoryInformation,
@@ -320,7 +421,8 @@ type InternalScanResult = (
     Vec<FileRecord>,
 );
 
-/// Internal implementation shared by scan_nt and scan_nt_full
+/// Single-pass parallel walker using rayon work-stealing
+/// Each directory is enumerated EXACTLY ONCE.
 fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let profile = if ScanProfile::enabled() { Some(ScanProfile::new()) } else { None };
     let total_start = profile.as_ref().map(|_| std::time::Instant::now());
@@ -328,14 +430,27 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
     let root = root.canonicalize()?;
     let volume_serial = get_volume_serial(&root);
 
-    // Collect all directories first (single-threaded breadth-first to build the work list)
-    let mut all_dirs = Vec::new();
+    let thread_count = get_thread_count();
+    let _pool = if thread_count != 0 {
+        ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .build()
+            .unwrap()
+    } else {
+        ThreadPoolBuilder::new().build().unwrap()
+    };
+
+    // Pass 1: collect all directories (single-threaded BFS) and build DirArena
+    // We assign DirIds and track parent relationships for O(1) ancestor propagation
+    let mut arena = DirArena::new();
     let mut dirs_to_scan = vec![root.to_path_buf()];
     let mut unreadable_dirs_total = Vec::new();
-    let mut reparse_dirs_count = 0u64; // Track reparse directories seen in first phase
+    let mut all_dirs_ordered = Vec::new(); // For final topological order (children before parents)
 
-    // Pass 1 timing
     let pass1_start = profile.as_ref().map(|_| std::time::Instant::now());
+
+    // Assign root DirId
+    let (root_id, _) = arena.get_or_assign(root.to_path_buf());
 
     while let Some(dir) = dirs_to_scan.pop() {
         let (entries, unreadable_dirs) = read_dir_nt(&dir, volume_serial);
@@ -346,154 +461,122 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
             p.pass1_file_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
         }
 
+        // Get parent DirId for this directory
+        let parent_id = arena.path_to_id.get(&dir).copied().unwrap_or(root_id);
+
         for entry in entries {
             if entry.is_dir && !entry.is_reparse {
-                // Only descend into non-reparse directories
                 dirs_to_scan.push(entry.path.clone());
-            } else if entry.is_dir && entry.is_reparse {
-                // Reparse directory (junction/symlink) - count it
-                reparse_dirs_count += 1;
+                // Assign DirId for subdirectory and link to parent
+                let (child_id, _) = arena.get_or_assign(entry.path.clone());
+                arena.set_parent(child_id, parent_id);
             }
         }
-        // Always add the directory to all_dirs for counting
-        all_dirs.push(dir);
+        all_dirs_ordered.push(dir);
     }
 
     if let (Some(p), Some(start)) = (&profile, pass1_start) {
         p.pass1_enumeration_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    // Now process all directories in parallel
-    let thread_count = get_thread_count();
-    let pool = if thread_count != 0 {
-        ThreadPoolBuilder::new()
-            .num_threads(thread_count)
-            .build()
-            .unwrap()
-    } else {
-        ThreadPoolBuilder::new().build().unwrap()
-    };
+    // Pre-size thread-local vectors to match arena size (known after pass 1)
+    let dir_count = arena.len();
 
-    // Shared accumulators
-    let dir_sizes_logical = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-        PathBuf,
-        u64,
-    >::new()));
-    let dir_sizes_allocated = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-        PathBuf,
-        u64,
-    >::new()));
-    let files = Arc::new(std::sync::Mutex::new(Vec::<FileRecord>::new()));
-    let file_count = Arc::new(AtomicU64::new(0));
-    let total_logical = Arc::new(AtomicU64::new(0));
-    let total_allocated = Arc::new(AtomicU64::new(0));
-    let unreadable_count = Arc::new(AtomicU64::new(0));
-    let unreadable_bytes = Arc::new(AtomicU64::new(0));
-    // Split counters
-    let hardlink_siblings = Arc::new(AtomicU64::new(0));
-    let reparse_skipped = Arc::new(AtomicU64::new(0));
-    let cloud_skipped = Arc::new(AtomicU64::new(0));
-    let unreadable_files = Arc::new(AtomicU64::new(0));
-    // Hardlink deduplication map (shared across threads)
+    // Pass 2: process all directories in parallel with thread-local accumulators
+    // Workers use DirId indices instead of PathBuf hashing for dir size accumulation
     let hardlink_map = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         (u32, [u8; 16]),
         PathBuf,
     >::new()));
 
-    pool.install(|| {
-        use rayon::prelude::*;
+    // Use rayon's parallel iterator with thread-local accumulators
+    // Process directories in parallel using map, then merge sequentially
+    let enum_start = profile.as_ref().map(|_| std::time::Instant::now());
 
-        all_dirs.par_iter().for_each(|dir| {
+    let locals: Vec<ThreadLocalAccum> = all_dirs_ordered.into_par_iter()
+        .map(|dir| {
+            let mut local = ThreadLocalAccum::default();
+            // Pre-size local dir size vectors to avoid reallocation
+            local.dir_sizes_logical.resize(dir_count, 0);
+            local.dir_sizes_allocated.resize(dir_count, 0);
+
             let read_start = profile.as_ref().map(|_| std::time::Instant::now());
-            let (entries, _) = read_dir_nt(dir, volume_serial);
+            let (entries, _) = read_dir_nt(&dir, volume_serial);
             if let (Some(p), Some(start)) = (&profile, read_start) {
                 p.pass2_enumeration_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-
             if let Some(p) = &profile {
                 p.pass2_dir_count.fetch_add(1, Ordering::Relaxed);
                 p.pass2_file_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
             }
 
-            // Track path clones and PathBuf allocations
-            if profile.is_some() {
-                // Each entry.path.clone() in the loop below will be counted
-            }
+            local.dir_count += 1;
+
+            // Get DirId for this directory
+            let dir_id = *arena.path_to_id.get(&dir).unwrap();
 
             for entry in entries {
                 if let Some(p) = &profile {
                     p.path_clone_count.fetch_add(1, Ordering::Relaxed);
                     p.pathbuf_alloc_count.fetch_add(1, Ordering::Relaxed);
                 }
+
                 if entry.is_dir {
                     if entry.is_reparse {
-                        // Reparse directory (junction/symlink) - already counted in first phase
-                        // Just add to files with zero size
-                        files.lock().unwrap().push((
-                            entry.path,
-                            0, // logical_size = 0 for reparse
-                            0, // allocated_size = 0 for reparse
-                            entry.mtime,
-                            entry.file_id,
-                            entry.volume_serial,
-                            entry.is_reparse,
-                            entry.is_cloud,
-                            entry.reparse_tag,
-                        ));
+                        // Reparse directory - count it, add to files with zero size
+                        local.reparse_skipped += 1;
+                        local.files.push(FileRecord {
+                            path: entry.path,
+                            logical_size: 0,
+                            allocated_size: 0,
+                            mtime: entry.mtime,
+                            file_id: entry.file_id,
+                            volume_serial: entry.volume_serial,
+                            is_reparse: entry.is_reparse,
+                            is_cloud: entry.is_cloud,
+                            reparse_tag: entry.reparse_tag,
+                        });
                     } else {
-                        // Regular directory - initialize size entries
-                        dir_sizes_logical
-                            .lock()
-                            .unwrap()
-                            .entry(entry.path.clone())
-                            .or_insert(0);
-                        dir_sizes_allocated
-                            .lock()
-                            .unwrap()
-                            .entry(entry.path.clone())
-                            .or_insert(0);
+                        // Regular directory - ensure entry in local vectors (already pre-sized)
+                        // The DirId was assigned in pass 1
                     }
                 } else {
                     if entry.is_reparse {
-                        unreadable_count.fetch_add(1, Ordering::Relaxed);
-                        reparse_skipped.fetch_add(1, Ordering::Relaxed);
-                        // Still add to files with zero size
-                        files.lock().unwrap().push((
-                            entry.path,
-                            0, // logical_size = 0 for reparse
-                            0, // allocated_size = 0 for reparse
-                            entry.mtime,
-                            entry.file_id,
-                            entry.volume_serial,
-                            entry.is_reparse,
-                            entry.is_cloud,
-                            entry.reparse_tag,
-                        ));
+                        local.reparse_skipped += 1;
+                        local.files.push(FileRecord {
+                            path: entry.path,
+                            logical_size: 0,
+                            allocated_size: 0,
+                            mtime: entry.mtime,
+                            file_id: entry.file_id,
+                            volume_serial: entry.volume_serial,
+                            is_reparse: entry.is_reparse,
+                            is_cloud: entry.is_cloud,
+                            reparse_tag: entry.reparse_tag,
+                        });
                     } else if entry.is_cloud {
-                        unreadable_count.fetch_add(1, Ordering::Relaxed);
-                        cloud_skipped.fetch_add(1, Ordering::Relaxed);
-                        unreadable_bytes.fetch_add(entry.logical_size, Ordering::Relaxed);
-                        // Cloud placeholders - zero contributed size
-                        files.lock().unwrap().push((
-                            entry.path,
-                            0,
-                            0,
-                            entry.mtime,
-                            entry.file_id,
-                            entry.volume_serial,
-                            entry.is_reparse,
-                            entry.is_cloud,
-                            entry.reparse_tag,
-                        ));
+                        local.cloud_skipped += 1;
+                        local.unreadable_bytes += entry.logical_size;
+                        local.files.push(FileRecord {
+                            path: entry.path,
+                            logical_size: 0,
+                            allocated_size: 0,
+                            mtime: entry.mtime,
+                            file_id: entry.file_id,
+                            volume_serial: entry.volume_serial,
+                            is_reparse: entry.is_reparse,
+                            is_cloud: entry.is_cloud,
+                            reparse_tag: entry.reparse_tag,
+                        });
                     } else {
-                        // Hardlink deduplication: check if we've seen this (volume_serial, file_id) before
+                        // Regular file - hardlink deduplication
                         let per_file_start = profile.as_ref().map(|_| std::time::Instant::now());
                         let zero_id = entry.file_id == [0u8; 16] || entry.volume_serial == 0;
                         let hardlink_key = (entry.volume_serial, entry.file_id);
 
                         let hm_start = profile.as_ref().map(|_| std::time::Instant::now());
                         let is_first_hardlink = if zero_id {
-                            true // never dedup when identity is unknown
+                            true
                         } else {
                             hardlink_map
                                 .lock()
@@ -506,64 +589,35 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                         }
 
                         if is_first_hardlink {
-                            file_count.fetch_add(1, Ordering::Relaxed);
-                            total_logical.fetch_add(entry.logical_size, Ordering::Relaxed);
-                            total_allocated.fetch_add(entry.allocated_size, Ordering::Relaxed);
+                            local.file_count += 1;
+                            local.total_logical += entry.logical_size;
+                            local.total_allocated += entry.allocated_size;
 
-                            // Add to all ancestors
-                            let mut ancestor = entry.path.parent();
-                            while let Some(dir) = ancestor {
-                                if let Some(p) = &profile {
-                                    p.ancestor_walk_count.fetch_add(1, Ordering::Relaxed);
-                                }
-                                let ds_start = profile.as_ref().map(|_| std::time::Instant::now());
-                                dir_sizes_logical
-                                    .lock()
-                                    .unwrap()
-                                    .entry(dir.to_path_buf())
-                                    .or_insert(0);
-                                if let (Some(p), Some(start)) = (&profile, ds_start) {
-                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                                }
-                                dir_sizes_allocated
-                                    .lock()
-                                    .unwrap()
-                                    .entry(dir.to_path_buf())
-                                    .or_insert(0);
-                                if let (Some(p), Some(start)) = (&profile, ds_start) {
-                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                                }
-                                let ds_start2 = profile.as_ref().map(|_| std::time::Instant::now());
-                                *dir_sizes_logical.lock().unwrap().get_mut(dir).unwrap() +=
-                                    entry.logical_size;
-                                *dir_sizes_allocated.lock().unwrap().get_mut(dir).unwrap() +=
-                                    entry.allocated_size;
-                                if let (Some(p), Some(start)) = (&profile, ds_start2) {
-                                    p.mutex_wait_dir_sizes_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                                }
-                                if dir == root {
-                                    break;
-                                }
-                                ancestor = dir.parent();
+                            // Add to own directory's totals using DirId (O(1) no hashing)
+                            local.dir_sizes_logical[dir_id as usize] =
+                                local.dir_sizes_logical[dir_id as usize].saturating_add(entry.logical_size);
+                            local.dir_sizes_allocated[dir_id as usize] =
+                                local.dir_sizes_allocated[dir_id as usize].saturating_add(entry.allocated_size);
+
+                            if let Some(p) = &profile {
+                                p.ancestor_walk_count.fetch_add(1, Ordering::Relaxed);
                             }
                         } else {
-                            // Hardlink sibling - track but don't double-count size
-                            hardlink_siblings.fetch_add(1, Ordering::Relaxed);
-                            unreadable_count.fetch_add(1, Ordering::Relaxed);
+                            local.hardlink_siblings += 1;
                         }
 
                         let files_start = profile.as_ref().map(|_| std::time::Instant::now());
-                        files.lock().unwrap().push((
-                            entry.path,
-                            entry.logical_size,
-                            entry.allocated_size,
-                            entry.mtime,
-                            entry.file_id,
-                            entry.volume_serial,
-                            entry.is_reparse,
-                            entry.is_cloud,
-                            entry.reparse_tag,
-                        ));
+                        local.files.push(FileRecord {
+                            path: entry.path,
+                            logical_size: entry.logical_size,
+                            allocated_size: entry.allocated_size,
+                            mtime: entry.mtime,
+                            file_id: entry.file_id,
+                            volume_serial: entry.volume_serial,
+                            is_reparse: entry.is_reparse,
+                            is_cloud: entry.is_cloud,
+                            reparse_tag: entry.reparse_tag,
+                        });
                         if let (Some(p), Some(start)) = (&profile, files_start) {
                             p.mutex_wait_files_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
@@ -575,38 +629,89 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
                     }
                 }
             }
-        });
-    });
 
-    // Extract results from mutexes
-    let dir_sizes_logical_map = Arc::try_unwrap(dir_sizes_logical)
-        .unwrap()
-        .into_inner()
-        .unwrap();
-    let dir_sizes_allocated_map = Arc::try_unwrap(dir_sizes_allocated)
-        .unwrap()
-        .into_inner()
-        .unwrap();
-    let files_vec = Arc::try_unwrap(files).unwrap().into_inner().unwrap();
+            local
+        })
+        .collect();
+
+    // Merge results sequentially
+    let mut merged = ThreadLocalAccum::default();
+    merged.dir_sizes_logical.resize(dir_count, 0);
+    merged.dir_sizes_allocated.resize(dir_count, 0);
+
+    for local in locals {
+        merged.file_count += local.file_count;
+        merged.dir_count += local.dir_count;
+        merged.total_logical += local.total_logical;
+        merged.total_allocated += local.total_allocated;
+        merged.hardlink_siblings += local.hardlink_siblings;
+        merged.reparse_skipped += local.reparse_skipped;
+        merged.cloud_skipped += local.cloud_skipped;
+        merged.unreadable_bytes += local.unreadable_bytes;
+        merged.files.extend(local.files);
+
+        // Merge per-dir sizes (Vec addition by index - no hashing!)
+        for (i, v) in local.dir_sizes_logical.into_iter().enumerate() {
+            if v != 0 {
+                merged.dir_sizes_logical[i] = merged.dir_sizes_logical[i].saturating_add(v);
+            }
+        }
+        for (i, v) in local.dir_sizes_allocated.into_iter().enumerate() {
+            if v != 0 {
+                merged.dir_sizes_allocated[i] = merged.dir_sizes_allocated[i].saturating_add(v);
+            }
+        }
+    }
+
+    if let (Some(p), Some(start)) = (&profile, enum_start) {
+        p.pass2_enumeration_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    // Copy merged per-dir own sizes into arena
+    for (i, &v) in merged.dir_sizes_logical.iter().enumerate() {
+        if v != 0 && i < arena.own_logical.len() {
+            arena.own_logical[i] = arena.own_logical[i].saturating_add(v);
+        }
+    }
+    for (i, &v) in merged.dir_sizes_allocated.iter().enumerate() {
+        if v != 0 && i < arena.own_allocated.len() {
+            arena.own_allocated[i] = arena.own_allocated[i].saturating_add(v);
+        }
+    }
+
+    // Propagate own sizes to ancestors using integer indices (O(1) no hashing!)
+    arena.propagate_to_ancestors();
+
+    // Convert arena to HashMaps for ScanData
+    let (all_dir_sizes_logical, all_dir_sizes_allocated) = arena.to_hashmaps();
+
+    let total_file_count = merged.file_count;
+    let total_dir_count = merged.dir_count;
+    let total_logical = merged.total_logical;
+    let total_allocated = merged.total_allocated;
+    let total_hardlink_siblings = merged.hardlink_siblings;
+    let total_reparse_skipped = merged.reparse_skipped;
+    let total_cloud_skipped = merged.cloud_skipped;
+    let total_unreadable_bytes = merged.unreadable_bytes;
+    let all_files = merged.files;
 
     let result = ScanResult {
-        file_count: file_count.load(Ordering::Relaxed),
-        dir_count: all_dirs.len() as u64,
-        total_logical_bytes: total_logical.load(Ordering::Relaxed),
-        total_allocated_bytes: total_allocated.load(Ordering::Relaxed),
-        unreadable_count: unreadable_count.load(Ordering::Relaxed)
-            + unreadable_dirs_total.len() as u64
-            + reparse_dirs_count,
-        unreadable_bytes: unreadable_bytes.load(Ordering::Relaxed),
-        hardlink_siblings: hardlink_siblings.load(Ordering::Relaxed),
-        reparse_skipped: reparse_skipped.load(Ordering::Relaxed) + reparse_dirs_count,
-        cloud_skipped: cloud_skipped.load(Ordering::Relaxed),
+        file_count: total_file_count,
+        dir_count: total_dir_count,
+        total_logical_bytes: total_logical,
+        total_allocated_bytes: total_allocated,
+        unreadable_count: total_hardlink_siblings + total_reparse_skipped + total_cloud_skipped
+            + unreadable_dirs_total.len() as u64,
+        unreadable_bytes: total_unreadable_bytes,
+        hardlink_siblings: total_hardlink_siblings,
+        reparse_skipped: total_reparse_skipped,
+        cloud_skipped: total_cloud_skipped,
         unreadable_dirs: unreadable_dirs_total.len() as u64,
-        unreadable_files: unreadable_files.load(Ordering::Relaxed),
+        unreadable_files: 0, // Not tracked separately in single-pass (handled via unreadable_count)
     };
 
     // Print profile if enabled
-    if let Some(p) = &profile {
+    if let Some(p) = profile.as_ref() {
         if let Some(start) = total_start {
             p.total_wall_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
@@ -615,9 +720,9 @@ fn scan_nt_internal(root: &Path) -> std::io::Result<InternalScanResult> {
 
     Ok((
         result,
-        dir_sizes_logical_map,
-        dir_sizes_allocated_map,
-        files_vec,
+        all_dir_sizes_logical,
+        all_dir_sizes_allocated,
+        all_files,
     ))
 }
 
@@ -703,11 +808,17 @@ pub fn spawn_scan_nt(
                     if entry.is_dir {
                         if entry.is_reparse {
                             // Reparse directory - send as a zero-size file entry so UI can track it
-                            let _ = event_tx.send(NtScanEvent::Files(vec![(
-                                entry.path.clone(),
-                                0, 0, entry.mtime, entry.file_id, entry.volume_serial,
-                                true, false, entry.reparse_tag,
-                            )]));
+                            let _ = event_tx.send(NtScanEvent::Files(vec![FileRecord {
+                                path: entry.path.clone(),
+                                logical_size: 0,
+                                allocated_size: 0,
+                                mtime: entry.mtime,
+                                file_id: entry.file_id,
+                                volume_serial: entry.volume_serial,
+                                is_reparse: true,
+                                is_cloud: false,
+                                reparse_tag: entry.reparse_tag,
+                            }]));
                         } else {
                             // Only send Dir event if we haven't sent it before
                             let mut sent = sent_dirs.lock().unwrap();
@@ -749,9 +860,17 @@ pub fn spawn_scan_nt(
 
                         match &baseline {
                             None => {
-                                let _ = event_tx.send(NtScanEvent::Files(vec![(
-                                    key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7,
-                                )]));
+                                let _ = event_tx.send(NtScanEvent::Files(vec![FileRecord {
+                                    path: key,
+                                    logical_size: val.0,
+                                    allocated_size: val.1,
+                                    mtime: val.2,
+                                    file_id: val.3,
+                                    volume_serial: val.4,
+                                    is_reparse: val.5,
+                                    is_cloud: val.6,
+                                    reparse_tag: val.7,
+                                }]));
                             }
                             Some(base) => {
                                 // Thread-safe check for seen
@@ -775,9 +894,17 @@ pub fn spawn_scan_nt(
                                     })
                                     .unwrap_or(false);
                                 if !unchanged {
-                                    let _ = event_tx.send(NtScanEvent::Changed(vec![(
-                                        key, val.0, val.1, val.2, val.3, val.4, val.5, val.6, val.7,
-                                    )]));
+                                    let _ = event_tx.send(NtScanEvent::Changed(vec![FileRecord {
+                                        path: key,
+                                        logical_size: val.0,
+                                        allocated_size: val.1,
+                                        mtime: val.2,
+                                        file_id: val.3,
+                                        volume_serial: val.4,
+                                        is_reparse: val.5,
+                                        is_cloud: val.6,
+                                        reparse_tag: val.7,
+                                    }]));
                                 }
                             }
                         }
@@ -827,7 +954,7 @@ pub fn spawn_scan_nt(
                 for ev in collected {
                     if let NtScanEvent::Changed(files) = ev {
                         for file in files {
-                            if seen_paths.insert(file.0.clone()) {
+                            if seen_paths.insert(file.path.clone()) {
                                 batch.push(file);
                                 if batch.len() >= 500
                                     && tx

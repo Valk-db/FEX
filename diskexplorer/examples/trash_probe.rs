@@ -12,11 +12,11 @@ use diskexplorer::nt_walker::simplify_path;
 use diskexplorer::recycle_guard::recycle_bin_item_count;
 #[allow(clippy::single_component_path_imports)]
 use trash;
+use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegOpenKeyExW, RegQueryValueExW,
-    RegEnumKeyExW, RegCloseKey,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW,
+    RegOpenKeyExW, RegQueryValueExW,
 };
-use windows::Win32::Foundation::{WIN32_ERROR, ERROR_SUCCESS};
 use windows::core::{PCWSTR, PWSTR};
 
 fn main() {
@@ -116,7 +116,10 @@ fn run_probe(dir: &Path) {
 
         let after_count_b = recycle_bin_item_count(&simplified.to_string_lossy()).unwrap_or(0);
         println!("    Recycle bin count after: {}", after_count_b);
-        println!("    Delta: {}", after_count_b.saturating_sub(before_count_b));
+        println!(
+            "    Delta: {}",
+            after_count_b.saturating_sub(before_count_b)
+        );
 
         // Check if file is in os_limited::list()
         let list_after_b = trash::os_limited::list().unwrap();
@@ -131,8 +134,16 @@ fn run_probe(dir: &Path) {
 
 fn dump_registry() {
     let hives = vec![
-        ("HKCU", HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
-        ("HKLM", HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"),
+        (
+            "HKCU",
+            HKEY_CURRENT_USER,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket",
+        ),
+        (
+            "HKLM",
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket",
+        ),
         (
             "HKCU_Policies",
             HKEY_CURRENT_USER,
@@ -148,10 +159,19 @@ fn dump_registry() {
     for (label, hive, key_path) in hives {
         println!("\n  {label}: {hive:?} {key_path}");
 
-        let key_wide: Vec<u16> = std::ffi::OsStr::new(key_path).encode_wide().chain(Some(0)).collect();
+        let key_wide: Vec<u16> = std::ffi::OsStr::new(key_path)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let mut hkey = HKEY::default();
         let result = unsafe {
-            RegOpenKeyExW(hive, PCWSTR(key_wide.as_ptr()), Some(0), KEY_READ, &mut hkey)
+            RegOpenKeyExW(
+                hive,
+                PCWSTR(key_wide.as_ptr()),
+                Some(0),
+                KEY_READ,
+                &mut hkey,
+            )
         };
 
         if result != ERROR_SUCCESS {
@@ -177,27 +197,42 @@ fn dump_registry() {
                 )
             };
 
-            if result == WIN32_ERROR(259u32) { // ERROR_NO_MORE_ITEMS
+            if result == WIN32_ERROR(259u32) {
+                // ERROR_NO_MORE_ITEMS
                 break;
             }
             if result != ERROR_SUCCESS {
                 break;
             }
 
-            let subkey_name = OsString::from_wide(&name_buf[..name_len as usize]).to_string_lossy().into_owned();
+            let subkey_name = OsString::from_wide(&name_buf[..name_len as usize])
+                .to_string_lossy()
+                .into_owned();
 
             // Open subkey and read values
             let subkey_path = format!("{}\\{}", key_path, subkey_name);
-            let subkey_wide: Vec<u16> = std::ffi::OsStr::new(&subkey_path).encode_wide().chain(Some(0)).collect();
+            let subkey_wide: Vec<u16> = std::ffi::OsStr::new(&subkey_path)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
             let mut sub_hkey = HKEY::default();
             let result = unsafe {
-                RegOpenKeyExW(hive, PCWSTR(subkey_wide.as_ptr()), Some(0), KEY_READ, &mut sub_hkey)
+                RegOpenKeyExW(
+                    hive,
+                    PCWSTR(subkey_wide.as_ptr()),
+                    Some(0),
+                    KEY_READ,
+                    &mut sub_hkey,
+                )
             };
 
             if result == ERROR_SUCCESS {
                 // Read NukeOnDelete and MaxCapacity
                 for value_name in ["NukeOnDelete", "MaxCapacity", "NoRecycleFiles"] {
-                    let value_wide: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
+                    let value_wide: Vec<u16> = std::ffi::OsStr::new(value_name)
+                        .encode_wide()
+                        .chain(Some(0))
+                        .collect();
                     let mut value = 0u32;
                     let mut value_size = std::mem::size_of::<u32>() as u32;
                     let result = unsafe {
@@ -214,12 +249,16 @@ fn dump_registry() {
                         println!("    {}: {} = {}", subkey_name, value_name, value);
                     }
                 }
-                unsafe { let _ = RegCloseKey(sub_hkey); }
+                unsafe {
+                    let _ = RegCloseKey(sub_hkey);
+                }
             }
 
             index += 1;
         }
 
-        unsafe { let _ = RegCloseKey(hkey); }
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
     }
 }

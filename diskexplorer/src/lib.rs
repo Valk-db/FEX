@@ -27,8 +27,37 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-/// Type aliases for complex scan data structures
-pub type FileRecord = (PathBuf, u64, u64, i64, [u8; 16], u32, bool, bool, u32);
+/// File record with all metadata from the Nt walker
+/// Fields match the original 9-tuple order for backward compatibility
+#[derive(Debug, Clone)]
+pub struct FileRecord {
+    pub path: PathBuf,
+    pub logical_size: u64,
+    pub allocated_size: u64,
+    pub mtime: i64,
+    pub file_id: [u8; 16],
+    pub volume_serial: u32,
+    pub is_reparse: bool,
+    pub is_cloud: bool,
+    pub reparse_tag: u32,
+}
+
+impl FileRecord {
+    /// Convert to the original tuple form for compatibility
+    pub fn into_tuple(self) -> (PathBuf, u64, u64, i64, [u8; 16], u32, bool, bool, u32) {
+        (
+            self.path,
+            self.logical_size,
+            self.allocated_size,
+            self.mtime,
+            self.file_id,
+            self.volume_serial,
+            self.is_reparse,
+            self.is_cloud,
+            self.reparse_tag,
+        )
+    }
+}
 
 /// Baseline entry type: (logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -621,7 +650,7 @@ impl App {
                     Ok(ScanEvent::Files(batch)) => {
                         let n = batch.len() as u64;
                         let mut batch_changed = false;
-                        for (
+                        for FileRecord {
                             path,
                             logical_size,
                             allocated_size,
@@ -630,8 +659,8 @@ impl App {
                             volume_serial,
                             is_reparse,
                             is_cloud,
-                            _reparse_tag,
-                        ) in batch
+                            reparse_tag: _reparse_tag,
+                        } in batch
                         {
                             // Handle reparse points (junctions, symlinks) - never follow, zero size
                             if is_reparse {
@@ -696,7 +725,7 @@ impl App {
                     Ok(ScanEvent::Changed(batch)) => {
                         let n = batch.len() as u64;
                         let mut batch_changed = false;
-                        for (
+                        for FileRecord {
                             path,
                             logical_size,
                             allocated_size,
@@ -705,8 +734,8 @@ impl App {
                             volume_serial,
                             is_reparse,
                             is_cloud,
-                            _reparse_tag,
-                        ) in batch
+                            reparse_tag: _reparse_tag,
+                        } in batch
                         {
                             // Handle reparse points
                             if is_reparse {
@@ -1784,6 +1813,20 @@ mod tests {
 
     fn tmpdir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("diskexplorer_test_{name}"));
+        // Clean up any existing junction first to avoid remove_dir_all issues
+        let junction = p.join("junction_loop");
+        if junction.exists() {
+            let _ = std::process::Command::new("cmd").args(["/C", "rmdir", junction.to_str().unwrap()]).status();
+        }
+        // Also restore permissions on any leftover unreadable_dir
+        let unreadable = p.join("unreadable_dir");
+        if unreadable.exists() {
+            if let Ok(username) = std::env::var("USERNAME") {
+                let _ = std::process::Command::new("icacls")
+                    .args([unreadable.to_str().unwrap(), "/grant", &format!("{}:F", username), "/inheritance:e"])
+                    .status();
+            }
+        }
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -1884,7 +1927,8 @@ mod tests {
         for ev in rx {
             match ev {
                 ScanEvent::Files(batch) => {
-                    for (_, size, _, _, _, _, _, _, _) in batch {
+                    for f in batch {
+                        let size = f.logical_size;
                         files += 1;
                         bytes += size;
                     }
@@ -1914,7 +1958,7 @@ mod tests {
         let baseline: HashMap<PathBuf, (u64, i64)> = data
             .files
             .iter()
-            .map(|(p, ls, _, m, _, _, _, _, _)| (p.clone(), (*ls, *m)))
+            .map(|f| (f.path.clone(), (f.logical_size, f.mtime)))
             .collect();
 
         // Change the world: delete one, grow one (new mtime), add one.
@@ -1933,7 +1977,7 @@ mod tests {
                     changed.extend(
                         batch
                             .into_iter()
-                            .map(|(p, ls, _, _, _, _, _, _, _)| (p, ls)),
+                            .map(|f| (f.path, f.logical_size)),
                     );
                 }
                 ScanEvent::Deleted(list) => deleted.extend(list),
@@ -1975,7 +2019,7 @@ mod tests {
         let root = root.canonicalize()?;
         let mut dir_sizes_logical: HashMap<PathBuf, u64> = HashMap::new();
         let mut dir_sizes_allocated: HashMap<PathBuf, u64> = HashMap::new();
-        let mut files: Vec<(PathBuf, u64, i64)> = Vec::new();
+        let mut files: Vec<FileRecord> = Vec::new();
         let mut file_count = 0u64;
         let mut dir_count = 0u64;
 
@@ -2002,7 +2046,17 @@ mod tests {
                         (m.len(), mtime)
                     })
                     .unwrap_or((0, 0));
-                files.push((path.clone(), size, mtime));
+                files.push(FileRecord {
+                path: path.clone(),
+                logical_size: size,
+                allocated_size: size,
+                mtime,
+                file_id: [0u8; 16],
+                volume_serial: 0,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            });
                 let mut ancestor = path.parent();
                 while let Some(dir) = ancestor {
                     *dir_sizes_logical.entry(dir.to_path_buf()).or_insert(0) += size;
@@ -2014,15 +2068,12 @@ mod tests {
                 }
             }
         }
-        let total_logical: u64 = files.iter().map(|(_, s, _)| *s).sum();
-        let total_allocated: u64 = files.iter().map(|(_, s, _)| *s).sum();
+        let total_logical: u64 = files.iter().map(|f| f.logical_size).sum();
+        let total_allocated: u64 = files.iter().map(|f| f.allocated_size).sum();
         Ok(ScanData {
             dir_sizes_logical,
             dir_sizes_allocated,
-            files: files
-                .into_iter()
-                .map(|(p, s, m)| (p, s, s, m, [0u8; 16], 0, false, false, 0))
-                .collect(),
+            files: files,
             file_count,
             dir_count,
             total_logical_bytes: total_logical,
@@ -2071,39 +2122,39 @@ mod tests {
         // Manually feed Files event with zero IDs (simulating jwalk output)
         // Use paths based on the canonicalized root so ancestor matching works
         let files = vec![
-            (
-                root.join("a.bin"),
-                100u64,
-                100u64,
-                1i64,
-                [0u8; 16],
-                0u32,
-                false,
-                false,
-                0u32,
-            ),
-            (
-                root.join("b.bin"),
-                200u64,
-                200u64,
-                2i64,
-                [0u8; 16],
-                0u32,
-                false,
-                false,
-                0u32,
-            ),
-            (
-                root.join("c.bin"),
-                300u64,
-                300u64,
-                3i64,
-                [0u8; 16],
-                0u32,
-                false,
-                false,
-                0u32,
-            ),
+            FileRecord {
+                path: root.join("a.bin"),
+                logical_size: 100,
+                allocated_size: 100,
+                mtime: 1,
+                file_id: [0u8; 16],
+                volume_serial: 0,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            },
+            FileRecord {
+                path: root.join("b.bin"),
+                logical_size: 200,
+                allocated_size: 200,
+                mtime: 2,
+                file_id: [0u8; 16],
+                volume_serial: 0,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            },
+            FileRecord {
+                path: root.join("c.bin"),
+                logical_size: 300,
+                allocated_size: 300,
+                mtime: 3,
+                file_id: [0u8; 16],
+                volume_serial: 0,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            },
         ];
         let rx = {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2167,28 +2218,28 @@ mod tests {
 
         // Feed two files with SAME non-zero file_id and volume_serial (simulating hardlinks)
         let files = vec![
-            (
-                root.join("a.bin"),
-                100u64,
-                100u64,
-                1i64,
-                [1u8; 16],
-                12345u32,
-                false,
-                false,
-                0u32,
-            ),
-            (
-                root.join("b.bin"),
-                100u64,
-                100u64,
-                1i64,
-                [1u8; 16],
-                12345u32,
-                false,
-                false,
-                0u32,
-            ),
+            FileRecord {
+                path: root.join("a.bin"),
+                logical_size: 100,
+                allocated_size: 100,
+                mtime: 1,
+                file_id: [1u8; 16],
+                volume_serial: 12345,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            },
+            FileRecord {
+                path: root.join("b.bin"),
+                logical_size: 100,
+                allocated_size: 100,
+                mtime: 1,
+                file_id: [1u8; 16],
+                volume_serial: 12345,
+                is_reparse: false,
+                is_cloud: false,
+                reparse_tag: 0,
+            },
         ];
         let rx = {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2371,7 +2422,7 @@ mod tests {
 
             // Verify NO scanned path lies under the junction
             for file_record in &scan_data.files {
-                let path = &file_record.0;
+                let path = &file_record.path;
                 if path.starts_with(&junction_dir) {
                     panic!("{} FAILED: scanned path under junction: {}", label, path.display());
                 }
@@ -2420,18 +2471,32 @@ mod tests {
                     }
                 }
                 crate::nt_walker::NtScanEvent::Files(batch) => {
-                    for (path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag) in batch {
+                    for f in batch {
+                        let path = f.path;
+                        let logical_size = f.logical_size;
+                        let allocated_size = f.allocated_size;
+                        let mtime = f.mtime;
+                        let file_id = f.file_id;
+                        let volume_serial = f.volume_serial;
+                        let is_reparse = f.is_reparse;
+                        let is_cloud = f.is_cloud;
+                        let reparse_tag = f.reparse_tag;
+
                         if is_reparse {
                             reparse_skipped += 1;
                             unreadable_count += 1;
-                            files.push((path, 0, 0, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag));
+                            files.push(FileRecord {
+                                path, logical_size: 0, allocated_size: 0, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag
+                            });
                             continue;
                         }
                         if is_cloud {
                             cloud_skipped += 1;
                             unreadable_count += 1;
                             unreadable_bytes += logical_size;
-                            files.push((path, 0, 0, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag));
+                            files.push(FileRecord {
+                                path, logical_size: 0, allocated_size: 0, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag
+                            });
                             continue;
                         }
                         let zero_id = file_id == [0u8; 16] || volume_serial == 0;
@@ -2454,7 +2519,9 @@ mod tests {
                             hardlink_siblings += 1;
                             unreadable_count += 1;
                         }
-                        files.push((path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag));
+                        files.push(FileRecord {
+                            path, logical_size, allocated_size, mtime, file_id, volume_serial, is_reparse, is_cloud, reparse_tag
+                        });
                     }
                 }
                 crate::nt_walker::NtScanEvent::Progress(_n) => {
@@ -2497,7 +2564,9 @@ mod tests {
         let mut files_no_dedup: Vec<FileRecord> = Vec::new();
         let mut total_logical_no_dedup = 0u64;
         for file_record in &scan_data_nt.files {
-            let (_, logical_size, _, _, _, _, is_reparse, is_cloud, _) = file_record;
+            let logical_size = file_record.logical_size;
+            let is_reparse = file_record.is_reparse;
+            let is_cloud = file_record.is_cloud;
             if !is_reparse && !is_cloud {
                 total_logical_no_dedup += logical_size;
             }
@@ -2597,11 +2666,6 @@ mod tests {
         // Footer should contain each split counter with exact fixture numbers
         assert!(status_line.contains("3 unreadable (~100 B not counted)"), "Footer missing unreadable count: {}", status_line);
         assert!(status_line.contains("size: logical (S toggles)"), "Footer missing size mode: {}", status_line);
-
-        // Mutation check: change one counter label in status_text -> test should fail
-        // We test by verifying the exact string format
-        assert!(status_line.contains("unreadable"), "Mutation: 'unreadable' label changed -> CAUGHT");
-        assert!(status_line.contains("size:"), "Mutation: 'size:' label changed -> CAUGHT");
     }
 
     #[test]
@@ -2633,19 +2697,19 @@ mod tests {
         // Note: We use the real paths for files that exist, and a nonexistent path for the cloud record
         let records = vec![
             // (1) Genuine duplicate pair - same content, different file IDs
-            (file1.clone(), 100u64, 100u64, 1i64, [1u8; 16], 1, false, false, 0),
-            (file2.clone(), 100u64, 100u64, 1i64, [2u8; 16], 1, false, false, 0),
+            FileRecord { path: file1.clone(), logical_size: 100, allocated_size: 100, mtime: 1, file_id: [1u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
+            FileRecord { path: file2.clone(), logical_size: 100, allocated_size: 100, mtime: 1, file_id: [2u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
             // (6) Same-size/different-content file
-            (file3.clone(), 100u64, 100u64, 1i64, [3u8; 16], 1, false, false, 0),
+            FileRecord { path: file3.clone(), logical_size: 100, allocated_size: 100, mtime: 1, file_id: [3u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
             // (2) Hardlink pair - same non-zero volume_serial+file_id
-            (hardlink_src.clone(), 200u64, 200u64, 1i64, [4u8; 16], 1, false, false, 0),
-            (hardlink_dst.clone(), 200u64, 200u64, 1i64, [4u8; 16], 1, false, false, 0),
+            FileRecord { path: hardlink_src.clone(), logical_size: 200, allocated_size: 200, mtime: 1, file_id: [4u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
+            FileRecord { path: hardlink_dst.clone(), logical_size: 200, allocated_size: 200, mtime: 1, file_id: [4u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
             // (3) Cloud-flagged record at NONEXISTENT path
-            (d.join("cloud_placeholder.txt"), 500u64, 500u64, 1i64, [5u8; 16], 1, false, true, 0),
+            FileRecord { path: d.join("cloud_placeholder.txt"), logical_size: 500, allocated_size: 500, mtime: 1, file_id: [5u8; 16], volume_serial: 1, is_reparse: false, is_cloud: true, reparse_tag: 0 },
             // (4) Reparse-flagged record
-            (d.join("reparse_point.txt"), 300u64, 300u64, 1i64, [6u8; 16], 1, true, false, 0),
+            FileRecord { path: d.join("reparse_point.txt"), logical_size: 300, allocated_size: 300, mtime: 1, file_id: [6u8; 16], volume_serial: 1, is_reparse: true, is_cloud: false, reparse_tag: 0 },
             // (5) Zero-byte file
-            (zero_file.clone(), 0u64, 0u64, 1i64, [7u8; 16], 1, false, false, 0),
+            FileRecord { path: zero_file.clone(), logical_size: 0, allocated_size: 0, mtime: 1, file_id: [7u8; 16], volume_serial: 1, is_reparse: false, is_cloud: false, reparse_tag: 0 },
         ];
 
         // Create App and manually feed records via poll_scan

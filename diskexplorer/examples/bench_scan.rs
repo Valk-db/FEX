@@ -54,7 +54,10 @@ fn scan_jwalk(root: &Path) -> ScanResult {
         .expect("Failed to run jwalk child process");
 
     if !output.status.success() {
-        eprintln!("jwalk child failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "jwalk child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::process::exit(1);
     }
 
@@ -72,7 +75,10 @@ fn scan_nt(root: &Path) -> ScanResult {
         .expect("Failed to run NT walker child process");
 
     if !output.status.success() {
-        eprintln!("NT walker child failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "NT walker child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::process::exit(1);
     }
 
@@ -224,7 +230,11 @@ fn run_jwalk_child(root: &Path) -> ScanResult {
     }
 
     let peak_mb = get_peak_working_set_mb();
-    let bytes_per_file = if file_count > 0 { total_logical as f64 / file_count as f64 } else { 0.0 };
+    let bytes_per_file = if file_count > 0 {
+        total_logical as f64 / file_count as f64
+    } else {
+        0.0
+    };
 
     ScanResult {
         walker: "jwalk".to_string(),
@@ -262,7 +272,11 @@ fn run_nt_child(root: &Path) -> ScanResult {
     }
 
     let peak_mb = get_peak_working_set_mb();
-    let bytes_per_file = if file_count > 0 { total_logical as f64 / file_count as f64 } else { 0.0 };
+    let bytes_per_file = if file_count > 0 {
+        total_logical as f64 / file_count as f64
+    } else {
+        0.0
+    };
 
     ScanResult {
         walker: "nt".to_string(),
@@ -279,7 +293,8 @@ fn run_nt_child(root: &Path) -> ScanResult {
 /// Get peak working set size in MB
 fn get_peak_working_set_mb() -> f64 {
     let mut pmc = windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX {
-        cb: std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        cb: std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>()
+            as u32,
         ..Default::default()
     };
 
@@ -287,7 +302,8 @@ fn get_peak_working_set_mb() -> f64 {
         windows::Win32::System::ProcessStatus::GetProcessMemoryInfo(
             windows::Win32::System::Threading::GetCurrentProcess(),
             &mut pmc as *mut _ as *mut _,
-            std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX>()
+                as u32,
         )
     };
 

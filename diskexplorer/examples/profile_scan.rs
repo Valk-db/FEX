@@ -2,8 +2,8 @@
 //!
 //! Run with: DISKEXPLORER_PROFILE=1 cargo run --release --example profile_scan -- <path>
 
-use std::path::PathBuf;
 use diskexplorer::nt_walker::scan_nt_full;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,7 +15,7 @@ fn main() {
 
     println!("Profiling scan on: {}", path.display());
     let scan_data = scan_nt_full(&path).expect("scan_nt_full failed");
-    
+
     println!("\nScan results:");
     println!("  Files: {}", scan_data.file_count);
     println!("  Dirs: {}", scan_data.dir_count);

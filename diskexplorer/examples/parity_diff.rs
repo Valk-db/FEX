@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use jwalk::WalkDir;
 use diskexplorer::nt_walker::scan_nt_full;
+use jwalk::WalkDir;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,8 +22,10 @@ fn main() {
     // Run Nt walker
     println!("Running Nt walker...");
     let nt_data = scan_nt_full(&path).expect("scan_nt_full failed");
-    println!("NT: {} files, {} dirs, {} logical bytes",
-             nt_data.file_count, nt_data.dir_count, nt_data.total_logical_bytes);
+    println!(
+        "NT: {} files, {} dirs, {} logical bytes",
+        nt_data.file_count, nt_data.dir_count, nt_data.total_logical_bytes
+    );
 
     // Run jwalk
     println!("Running jwalk...");
@@ -35,19 +37,25 @@ fn main() {
             Err(_) => continue,
         };
         if entry.file_type().is_file()
-            && let Ok(meta) = entry.metadata() {
-                let size = meta.len();
-                jwalk_files.push((entry.path(), size));
-            }
+            && let Ok(meta) = entry.metadata()
+        {
+            let size = meta.len();
+            jwalk_files.push((entry.path(), size));
+        }
     }
     let jwalk_count = jwalk_files.len();
     let jwalk_logical: u64 = jwalk_files.iter().map(|(_, s)| *s).sum();
-    println!("jwalk: {} files, {} logical bytes", jwalk_count, jwalk_logical);
+    println!(
+        "jwalk: {} files, {} logical bytes",
+        jwalk_count, jwalk_logical
+    );
 
     // Sort both lists by path
-    let mut nt_list: Vec<(PathBuf, u64)> = nt_data.files.iter()
-        .filter(|(_, _, _, _, _, _, is_reparse, is_cloud, _)| !is_reparse && !is_cloud)
-        .map(|(p, ls, _, _, _, _, _, _, _)| (p.clone(), *ls))
+    let mut nt_list: Vec<(PathBuf, u64)> = nt_data
+        .files
+        .iter()
+        .filter(|f| !f.is_reparse && !f.is_cloud)
+        .map(|f| (f.path.clone(), f.logical_size))
         .collect();
     nt_list.sort_by(|a, b| a.0.cmp(&b.0));
     jwalk_files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -56,11 +64,13 @@ fn main() {
     let nt_file = std::env::temp_dir().join("nt_parity.txt");
     let jwalk_file = std::env::temp_dir().join("jwalk_parity.txt");
 
-    let nt_content = nt_list.iter()
+    let nt_content = nt_list
+        .iter()
         .map(|(p, s)| format!("{}\t{}", p.display(), s))
         .collect::<Vec<_>>()
         .join("\n");
-    let jwalk_content = jwalk_files.iter()
+    let jwalk_content = jwalk_files
+        .iter()
         .map(|(p, s)| format!("{}\t{}", p.display(), s))
         .collect::<Vec<_>>()
         .join("\n");
@@ -70,7 +80,13 @@ fn main() {
 
     println!("\n--- Diffing ---");
     let output = Command::new("cmd")
-        .args(["/C", "diff", "-u", nt_file.to_str().unwrap(), jwalk_file.to_str().unwrap()])
+        .args([
+            "/C",
+            "diff",
+            "-u",
+            nt_file.to_str().unwrap(),
+            jwalk_file.to_str().unwrap(),
+        ])
         .output()
         .expect("diff failed");
 
@@ -115,10 +131,11 @@ fn main() {
     let mut mismatches = 0;
     for (p, s) in &jwalk_files {
         if let Some(nt_s) = nt_map.get(p)
-            && *nt_s != *s {
-                println!("  MISMATCH: {} NT={} jwalk={}", p.display(), nt_s, s);
-                mismatches += 1;
-            }
+            && *nt_s != *s
+        {
+            println!("  MISMATCH: {} NT={} jwalk={}", p.display(), nt_s, s);
+            mismatches += 1;
+        }
     }
     if mismatches == 0 {
         println!("  (none)");
@@ -131,9 +148,11 @@ fn main() {
     println!("NT-only: {}", nt_only);
     println!("jwalk-only: {}", jwalk_only);
     println!("Size mismatches: {}", mismatches);
-    println!("Logical bytes diff: {} (NT - jwalk = {})",
-             (nt_data.total_logical_bytes as i128 - jwalk_logical as i128),
-             nt_data.total_logical_bytes as i128 - jwalk_logical as i128);
+    println!(
+        "Logical bytes diff: {} (NT - jwalk = {})",
+        (nt_data.total_logical_bytes as i128 - jwalk_logical as i128),
+        nt_data.total_logical_bytes as i128 - jwalk_logical as i128
+    );
 
     // Re-run check for churn
     if nt_only > 0 || jwalk_only > 0 || mismatches > 0 {
@@ -144,37 +163,65 @@ fn main() {
         let nt_data2 = scan_nt_full(&path).expect("scan_nt_full failed");
         let mut jwalk_files2: Vec<(PathBuf, u64)> = Vec::new();
         for entry in WalkDir::new(&root).skip_hidden(false) {
-            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             if entry.file_type().is_file()
-                && let Ok(meta) = entry.metadata() {
-                    jwalk_files2.push((entry.path(), meta.len()));
-                }
+                && let Ok(meta) = entry.metadata()
+            {
+                jwalk_files2.push((entry.path(), meta.len()));
+            }
         }
         jwalk_files2.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut nt_list2: Vec<(PathBuf, u64)> = nt_data2.files.iter()
-            .filter(|(_, _, _, _, _, _, is_reparse, is_cloud, _)| !is_reparse && !is_cloud)
-            .map(|(p, ls, _, _, _, _, _, _, _)| (p.clone(), *ls))
+        let mut nt_list2: Vec<(PathBuf, u64)> = nt_data2
+            .files
+            .iter()
+            .filter(|f| !f.is_reparse && !f.is_cloud)
+            .map(|f| (f.path.clone(), f.logical_size))
             .collect();
         nt_list2.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Check if differences persist
         let nt_set2: std::collections::HashSet<_> = nt_list2.iter().map(|(p, _)| p).collect();
-        let jwalk_set2: std::collections::HashSet<_> = jwalk_files2.iter().map(|(p, _)| p).collect();
+        let jwalk_set2: std::collections::HashSet<_> =
+            jwalk_files2.iter().map(|(p, _)| p).collect();
 
-        let nt_only_1: Vec<_> = nt_list.iter().filter(|(p, _)| !jwalk_set.contains(p)).collect();
-        let nt_only_2: Vec<_> = nt_list2.iter().filter(|(p, _)| !jwalk_set2.contains(p)).collect();
+        let nt_only_1: Vec<_> = nt_list
+            .iter()
+            .filter(|(p, _)| !jwalk_set.contains(p))
+            .collect();
+        let nt_only_2: Vec<_> = nt_list2
+            .iter()
+            .filter(|(p, _)| !jwalk_set2.contains(p))
+            .collect();
 
         println!("NT-only in run 1: {}", nt_only_1.len());
         println!("NT-only in run 2: {}", nt_only_2.len());
-        let persistent_nt_only = nt_only_1.iter().filter(|(p, _)| nt_only_2.iter().any(|(p2, _)| p == p2)).count();
+        let persistent_nt_only = nt_only_1
+            .iter()
+            .filter(|(p, _)| nt_only_2.iter().any(|(p2, _)| p == p2))
+            .count();
         println!("Persistent NT-only (both runs): {}", persistent_nt_only);
 
-        let jwalk_only_1: Vec<_> = jwalk_files.iter().filter(|(p, _)| !nt_set.contains(p)).collect();
-        let jwalk_only_2: Vec<_> = jwalk_files2.iter().filter(|(p, _)| !nt_set2.contains(p)).collect();
+        let jwalk_only_1: Vec<_> = jwalk_files
+            .iter()
+            .filter(|(p, _)| !nt_set.contains(p))
+            .collect();
+        let jwalk_only_2: Vec<_> = jwalk_files2
+            .iter()
+            .filter(|(p, _)| !nt_set2.contains(p))
+            .collect();
         println!("jwalk-only in run 1: {}", jwalk_only_1.len());
         println!("jwalk-only in run 2: {}", jwalk_only_2.len());
-        let persistent_jwalk_only = jwalk_only_1.iter().filter(|(p, _)| jwalk_only_2.iter().any(|(p2, _)| p == p2)).count();
-        println!("Persistent jwalk-only (both runs): {}", persistent_jwalk_only);
+        let persistent_jwalk_only = jwalk_only_1
+            .iter()
+            .filter(|(p, _)| jwalk_only_2.iter().any(|(p2, _)| p == p2))
+            .count();
+        println!(
+            "Persistent jwalk-only (both runs): {}",
+            persistent_jwalk_only
+        );
     }
 }
